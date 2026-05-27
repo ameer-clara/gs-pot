@@ -8,10 +8,29 @@ class ScanStatus(str, Enum):
     QUEUED = "queued"
     CAPTURING = "capturing"
     POSES = "poses"
+    # `SLAM` is the LiDAR-pose equivalent of `POSES` — it surfaces the
+    # `mode=lidar` step where we write a COLMAP-binary workspace from a
+    # SLAM pose dump instead of running pycolmap. Distinct so the UI can
+    # show "writing colmap-bin from lidar" instead of "running colmap".
+    SLAM = "slam"
     TRAINING = "training"
     PUSHING = "pushing"
     READY = "ready"
     ERROR = "error"
+
+
+class PoseMode(str, Enum):
+    """How the per-frame camera poses for a scan are produced.
+
+    `colmap` runs pycolmap SfM over the staged images (the legacy path;
+    10–40 min on apartments). `lidar` skips SfM and writes a
+    COLMAP-binary workspace directly from a robohack-served LiDAR cloud
+    + per-frame 6-DoF pose dump (the Tier-A path in
+    research/07-lidar-splat-plan.md; ~3-5 min on M4).
+    """
+
+    COLMAP = "colmap"
+    LIDAR = "lidar"
 
 
 class ScanSource(str, Enum):
@@ -125,6 +144,11 @@ class ProcessRunRequest(BaseModel):
     # ~3× faster per iteration so 2000 is its sweet spot.
     steps: int | None = Field(default=None, ge=500, le=60000)
     quality: str = Field(default="low", pattern=r"^(low|medium|high|extreme)$")
+    # `colmap` (default) preserves today's behavior; `lidar` activates the
+    # research/07 Tier-A path: pull pointcloud + poses from robohack, write
+    # a COLMAP-binary workspace via lidar_poses.write_colmap_workspace,
+    # train with Brush. Skips pycolmap SfM entirely (~5-10× faster).
+    mode: PoseMode = PoseMode.COLMAP
 
 
 class ProcessRunResponse(BaseModel):
