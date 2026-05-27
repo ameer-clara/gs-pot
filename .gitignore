@@ -38,6 +38,10 @@ bin/*
 !bin/README.md
 scenes/
 images/
+<<<<<<< HEAD
+=======
+vid/
+>>>>>>> 966062a (feat: implement optional splat ingestion pipeline and add httpx/pycolmap dependencies)
 
 # uv / Python packaging
 *.egg-info/
