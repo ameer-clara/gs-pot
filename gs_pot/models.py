@@ -1,0 +1,79 @@
+from datetime import datetime
+from enum import Enum
+
+from pydantic import BaseModel, Field
+
+
+class ScanStatus(str, Enum):
+    QUEUED = "queued"
+    CAPTURING = "capturing"
+    POSES = "poses"
+    TRAINING = "training"
+    READY = "ready"
+    ERROR = "error"
+
+
+class ScanSource(str, Enum):
+    IMAGES = "images"
+    VIDEO = "video"
+    GO2 = "go2"
+    DIMOS_REPLAY = "dimos_replay"
+
+
+# ── Property: a group of scans (one apartment / building / listing) ───────────
+
+
+class CreatePropertyRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=256)
+    address: str | None = Field(default=None, max_length=512)
+
+
+class CreatePropertyResponse(BaseModel):
+    property_id: str
+
+
+class Property(BaseModel):
+    property_id: str
+    name: str
+    address: str | None = None
+    created_at: datetime
+
+
+# ── Scan: one capture+train run, produces one .ply ────────────────────────────
+
+
+class CreateScanRequest(BaseModel):
+    property_id: str = Field(min_length=1, description="Parent Property; must already exist.")
+    scene_name: str = Field(min_length=1, max_length=128, description="Per-room label, e.g. 'living_room'.")
+    source: ScanSource = ScanSource.IMAGES
+    images_dir: str | None = None
+    video_path: str | None = None
+    steps: int = Field(default=7000, ge=500, le=60000)
+    quality: str = Field(default="medium", pattern=r"^(low|medium|high|extreme)$")
+
+
+class CreateScanResponse(BaseModel):
+    scan_id: str
+
+
+class ScanInfo(BaseModel):
+    scan_id: str
+    property_id: str
+    scene_name: str
+    source: ScanSource
+    status: ScanStatus
+    progress: float = 0.0
+    scene_url: str | None = None
+    thumb_url: str | None = None
+    error: str | None = None
+    created_at: datetime
+
+
+class PropertyDetail(BaseModel):
+    """A Property plus its scans — the natural unit a UI renders."""
+
+    property_id: str
+    name: str
+    address: str | None
+    created_at: datetime
+    scans: list[ScanInfo]

@@ -7,6 +7,14 @@ Shanghai (May 26–28, 2026)** — 48h, Unitree Go2 + DimOS, three tracks
 `research/00-synthesis.md` for the master strategy and `research/01-dimos-codebase-map.md`
 for verified DimOS internals before making stack changes.
 
+## Collaboration rules
+
+- **Do not run `git commit` or `git push` without explicit per-commit
+  authorization in the current turn.** Edit files, run servers, scaffold,
+  run tests freely — but pause before invoking git and ask. Earlier
+  authorization in the same session does not extend to later commits.
+- When work is done, summarize what changed and ask "commit?" — don't commit.
+
 ## What we're building
 
 > The Go2 walks an apartment, streams RGB + odometry, we train a 3D Gaussian
@@ -76,26 +84,29 @@ If yes → gsplat. If no → Brush (and a much shorter scene budget).
 
 ### 3. Browser viewer — pick one, ship the WebXR path
 
-| Viewer | Stack | WebXR | Format |
-|---|---|---|---|
-| **@mkkellogg/gaussian-splats-3d** | Three.js | ✅ | `.ply`, `.splat` |
-| **Spark** (Niantic) | Three.js | ✅ | `.spz` (compressed) |
-| **gsplat.js** (antimatter15) | WebGL | partial | `.splat` |
-| **SuperSplat viewer** | PlayCanvas | ✅ | `.ply` |
+| Viewer | Stack | WebXR | Format | Status |
+|---|---|---|---|---|
+| **Spark 2.0** (World Labs) | Three.js + WebGL2 | ✅ Quest 3, Vision Pro | `.spz`, `.ply`, `.splat`, `.ksplat`, `.sog` | **Active, v2.1.0 May 2026** |
+| ~~@mkkellogg/gaussian-splats-3d~~ | Three.js | ✅ | `.ply`, `.splat` | ⚠️ **Maintainer deprecated it; points to Spark** |
+| **SuperSplat viewer** | PlayCanvas | ✅ | `.ply` | Alternative; less active |
 
-**Default plan:** `@mkkellogg/gaussian-splats-3d`. Most mature WebXR path,
-best community examples for Quest. Convert .ply → .splat for transport.
+**Default plan: Spark 2.0.** Three.js + WebGL2 with confirmed WebXR on Quest 3
+and Apple Vision Pro. Streams 100M+ splats via LoD pages (only 1–2M in GPU
+memory at once) — fits "walk the apartment, see every room" without
+manual chunking. Live `basic-xr` example in the repo at
+`examples/basic-xr/index.html` — that's the scaffold we're forking.
 
 ## Stack we're shipping (default, override only with reason)
 
 | Layer | Pick | Why |
 |---|---|---|
 | Capture | DimOS `@skill` on `color_image` + `odom_stream` | Aligned with the Patrol Dog architecture; one MCP call to start/stop |
-| Poses | Go2 odom → COLMAP format (MASt3R-SfM as fallback) | Robot knows its pose; skip the SfM tax |
-| Train | `gsplat` (Brush if no CUDA) | Fast + modern |
-| Format | `.splat` (compressed from `.ply`) | Browser-friendly |
-| Viewer | Three.js + `@mkkellogg/gaussian-splats-3d` | Mature WebXR |
-| Serve | FastAPI + static `/scenes/<id>/scene.splat` | Same VPS that hosts the payment webhook from robohack/RUNBOOK |
+| Poses | Go2 odom → COLMAP format (InstantSplat as CUDA fallback) | Robot knows its pose; skip the SfM tax. InstantSplat handles pose+splat jointly if odom is bad **and** we have CUDA |
+| Train (primary) | **Brush 0.3.0** | Rust/WGPU runs Mac/Linux/Web; "faster than gsplat" per README; outputs `.compressed.ply` Spark reads natively. No CUDA dependency = ships on the venue laptop regardless |
+| Train (CUDA path) | gsplat | If venue laptop has Nvidia; fastest known |
+| Format | `.compressed.ply` (Brush native) → `.spz` for streaming if needed | Spark consumes both |
+| Viewer | **Spark 2.0** (Three.js + WebGL2) | WebXR on Quest 3 + Vision Pro; LoD streaming up to 100M splats |
+| Serve | FastAPI + static `/scenes/<id>/scene.ply` + `/web/` | Same VPS that hosts the payment webhook from robohack/RUNBOOK |
 
 ## DimOS integration — the `@skill` seam
 
@@ -201,10 +212,11 @@ gs-pot/
 
 ## External references (verify before depending on)
 
-- gsplat — `https://github.com/nerfstudio-project/gsplat`
-- Brush — `https://github.com/ArthurBrussee/brush`
+- Spark (viewer) — `https://github.com/sparkjsdev/spark` · `https://sparkjs.dev`
+- Spark 2.0 launch (LoD streaming, Quest/Vision Pro) — `https://www.worldlabs.ai/blog/spark-2.0`
+- Brush (trainer) — `https://github.com/ArthurBrussee/brush`
+- gsplat (CUDA trainer) — `https://github.com/nerfstudio-project/gsplat`
+- InstantSplat (CUDA pose-free) — `https://github.com/NVlabs/InstantSplat`
 - MASt3R-SfM — `https://github.com/naver/mast3r`
 - GLOMAP — `https://github.com/colmap/glomap`
-- @mkkellogg/gaussian-splats-3d — `https://github.com/mkkellogg/GaussianSplats3D`
-- Spark — `https://github.com/sparkjs/spark`
 - Beike VR product context — `https://vr.ke.com/` (the market we're targeting)

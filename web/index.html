@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gs-pot — VR walkthrough</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #eee; font-family: -apple-system, system-ui, sans-serif; }
+    canvas { touch-action: none; display: block; }
+    #hint { position: fixed; bottom: 16px; left: 16px; right: 16px; font-size: 12px; opacity: 0.6; pointer-events: none; max-width: 540px; }
+    #hint a { color: #8ab4ff; }
+  </style>
+</head>
+<body>
+  <div id="hint">
+    Drag to look · WASD to walk · click "Enter VR" (top-right) on a Quest/Vision Pro browser.
+    Pass <code>?scene=URL</code> to load a custom <code>.spz</code> / <code>.ply</code> / <code>.splat</code>.
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+        "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.1.0/spark.module.js"
+      }
+    }
+  </script>
+  <script type="module" src="./viewer.js"></script>
+</body>
+</html>

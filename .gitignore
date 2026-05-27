@@ -32,3 +32,13 @@ build/
 
 # OMC
 .omc/
+
+# gs-pot runtime
+bin/*
+!bin/README.md
+scenes/
+
+# uv / Python packaging
+*.egg-info/
+dist/
+.uv-cache/
