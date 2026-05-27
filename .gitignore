@@ -37,8 +37,11 @@ build/
 bin/*
 !bin/README.md
 scenes/
+images/
 
 # uv / Python packaging
 *.egg-info/
 dist/
 .uv-cache/
+
+target/

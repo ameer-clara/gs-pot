@@ -10,6 +10,8 @@ dependencies = [
     "opencv-python>=4.10",
     "numpy>=2",
     "pillow>=11",
+    "httpx>=0.28",
+    "pycolmap>=4.0.4",
 ]
 
 [project.optional-dependencies]

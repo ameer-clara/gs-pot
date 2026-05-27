@@ -9,6 +9,7 @@ class ScanStatus(str, Enum):
     CAPTURING = "capturing"
     POSES = "poses"
     TRAINING = "training"
+    PUSHING = "pushing"
     READY = "ready"
     ERROR = "error"
 
@@ -66,6 +67,10 @@ class ScanInfo(BaseModel):
     scene_url: str | None = None
     thumb_url: str | None = None
     error: str | None = None
+    # Robohack `/api/robot/splat` returns {key, id} after a successful push.
+    # Populated only when GS_POT_INGEST_URL + GS_POT_INGEST_TOKEN are configured.
+    ingest_id: str | None = None
+    ingest_key: str | None = None
     created_at: datetime
 
 

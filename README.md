@@ -120,8 +120,91 @@ Open the URL the CLI printed:
 http://localhost:8000/web/?scene=/scenes/<scan_id>.ply
 ```
 
-- Desktop: Chrome 134+ on Mac (Spark uses modern WebGL2).
-- VR: open the same URL on Quest 3 / Vision Pro browser, click "Enter VR".
+- Desktop: Chrome 134+ on Mac (Spark uses modern WebGL2). Drag to look, WASD to move.
+- VR: open the same URL on Quest 3 / Vision Pro browser, click "Enter VR" (top-right).
+- Phone: open in iOS Safari or Android Chrome — viewer works, just no head tracking.
+
+## How the pipeline works
+
+`scan-room.sh` orchestrates the full producer side:
+
+```
+./scripts/scan-room.sh <room> "<property-name>"
+    │
+    ├─ HEIC → JPG conversion (sips, ffmpeg fallback)
+    └─ exec  uv run python -m gs_pot scan ...
+                │
+                ├─ A. POSES        — pycolmap.extract_features
+                │                    pycolmap.match_exhaustive
+                │                    pycolmap.incremental_mapping
+                │                    → scenes/<id>/sparse/0/*.bin
+                │
+                ├─ B. TRAINING     — bin/brush <workspace> --total-steps N
+                │                    → scenes/<id>/scene.ply
+                │
+                ├─ C. PUSH         — POST to robohack `/api/robot/splat`
+                │                    (skipped if GS_POT_INGEST_URL unset)
+                │
+                ├─ D. THUMBNAIL    — first image → scenes/<id>/thumb.jpg
+                │
+                └─ E. READY        — scan status flipped to "ready" in store,
+                                     scene_url=/scenes/<id>.ply
+```
+
+Output sitting on disk for each scan:
+
+```
+scenes/<scan_id>/
+  database.db    ← COLMAP SfM database (intermediate)
+  images/        ← per-file symlinks of the inputs (filtered, no .DS_Store etc.)
+  sparse/0/      ← cameras.bin, images.bin, points3D.bin
+  scene.ply      ← the Gaussian splat — this is what Spark loads
+  thumb.jpg      ← first frame, served at /scenes/<id>/thumb.jpg
+```
+
+The `scene.ply` is the boundary file between producer (us) and consumer (the
+teammate's front-end / Spark). When `GS_POT_INGEST_URL` is set, the same
+`.ply` is also POSTed to robohack's ingest endpoint — see
+[Pushing splats to robohack](#pushing-splats-to-robohack-production-integration)
+below.
+
+### Why pycolmap, not the colmap CLI
+
+We use [pycolmap](https://github.com/colmap/pycolmap) (pip-installable COLMAP
+Python bindings) instead of invoking the `colmap` CLI as a subprocess.
+Reason: Homebrew's macOS arm64 build of COLMAP has a deterministic
+use-after-free in `Creating SIFT CPU feature matcher` that crashes the
+matcher with SIGSEGV. pycolmap's wheels ship their own COLMAP binary built
+via cibuildwheel for darwin-arm64 and don't hit the bug. The Python API is
+also cleaner — no flag-name-by-version churn.
+
+## Pushing splats to robohack (production integration)
+
+In production gs-pot is **the reconstruction box** for
+[robohack](https://github.com/grmkris/robohack). Their `apps/server` exposes
+a token-guarded `POST /api/robot/splat` endpoint; their `apps/web` lists the
+ingested splats via oRPC and renders them with Spark. gs-pot pushes finished
+`.ply` files there.
+
+Set two env vars and the pipeline auto-pushes after every Brush export:
+
+```bash
+export GS_POT_INGEST_URL="https://<robohack-server>/api/robot/splat"
+export GS_POT_INGEST_TOKEN="<ROBOT_INGEST_TOKEN from robohack/apps/server>"
+
+# Now scans auto-upload:
+uv run python -m gs_pot scan \
+    --images ./photos/living_room \
+    --property-name "Apt 3F" \
+    --scene-name "living_room"
+# → produces scene.ply, then POSTs to /api/robot/splat with
+#   Authorization: Bearer <token>
+#   multipart: file=scene.ply, format=ply, name="Apt 3F · living_room"
+```
+
+The scan's `ingest_id` and `ingest_key` fields (visible via
+`GET /scans/{scan_id}`) record what robohack assigned. If either env var is
+missing, the push step is skipped silently — handy for local development.
 
 ## Multi-property workflow (server mode)
 
@@ -184,13 +267,15 @@ gs_pot/
   models.py          # pydantic types — the contract
   store.py           # in-memory Property + Scan registries
   server.py          # FastAPI: /properties, /scans, /scenes, mounts /web
-  pipeline.py        # orchestrator: poses → train → thumb → READY
+  pipeline.py        # orchestrator: poses → train → push → thumb → READY
   poses.py           # COLMAP subprocess wrapper (CPU mode, no CUDA)
   train.py           # Brush subprocess wrapper
+  ingest.py          # POST .ply to robohack's /api/robot/splat (Bearer auth)
   thumb.py           # first-image → JPG thumbnail
   cli.py             # `python -m gs_pot scan ...`
 tests/
-  test_contract.py   # 18 producer/consumer contract tests
+  test_contract.py   # producer/consumer API contract tests
+  test_ingest.py     # robohack push contract (multipart, Bearer, format/name)
 web/                 # Spark 2.0 + WebXR smoke viewer (mounted at /web)
 scripts/dev.sh       # uvicorn launcher
 bin/                 # external binaries — gitignored, see bin/README.md
