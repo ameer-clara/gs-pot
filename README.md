@@ -258,64 +258,272 @@ matcher with SIGSEGV. pycolmap's wheels ship their own COLMAP binary built
 via cibuildwheel for darwin-arm64 and don't hit the bug. The Python API is
 also cleaner — no flag-name-by-version churn.
 
-## End-to-end with robohack — `/api/runs/<run_id>/process` webhook
+## End-to-end walkthrough (in detail)
 
-Production flow. Robohack's front-end drives a capture session, then calls
-gs-pot via ngrok to trigger processing on "End run":
+This is the full production loop — from a robot capturing frames to a buyer
+viewing the trained splat in VR. Every API call, every env var, every log
+line you'd see. The Mermaid diagrams in [FLOWS.md](./FLOWS.md) are the
+visual counterpart.
 
-```
-[Front-end]   pick run_id (uuid); tell robot to begin
+### Cast of characters
 
-[Go2 + DimOS] POST <robohack>/api/robot/frame   run=<id> position=N angle=θ   (×N images)
+| Service | Where | Role |
+|---|---|---|
+| **robohack `apps/server`** | Railway, behind Caddy gateway | Frames + splats source of truth (Hono on Bun, Postgres for metadata, S3 for blobs) |
+| **robohack `apps/gateway`** | Railway | Single public host `https://gateway-production-…railway.app`. Caddy routes `/api/robot/*`, `/api/scans*`, `/api/auth/*`, `/rpc/*`, `/api/upload/*` to apps/server; everything else to apps/web. |
+| **robohack `apps/web`** | Railway, behind same gateway | Next.js front-end. "Build splat" button on `/scans` |
+| **Go2 + DimOS** | On the venue LAN | Captures images; POSTs each to apps/server `/api/robot/frame` with `run`/`position`/`angle` |
+| **gs-pot** *(this repo)* | Your Mac, via ngrok | The reconstruction box. Receives the webhook, downloads frames, runs COLMAP + Brush + gravity-align, pushes the `.ply` back |
+| **ngrok** | Your Mac | Public HTTPS tunnel from `https://twilight-getting-possum.ngrok-free.dev` → `localhost:8000` |
 
-[Front-end]   user clicks "End run"
-              │
-              ▼  POST <YOUR_NGROK_URL>/api/runs/<run_id>/process
-                     { robohack_base, ingest_token,
-                       [trainer, steps, quality, scene_name] }
+### Setup checklist (one-time per dev box)
 
-[gs-pot]      202 → { scan_id, queue_depth }
-              ├─ download all frames for run_id from <robohack>/api/scans/<run_id>
-              │  (presigned S3 URLs, 6h TTL — no auth needed)
-              ├─ existing pipeline: HEIC-skip → COLMAP → gravity-align → train
-              └─ POST scene.ply → <robohack>/api/robot/splat   Bearer <ingest_token>
-                     name="run:<run_id>"
-
-[Front-end]   GET <robohack>/api/scans renders the new splat with the run's frames
-```
-
-Endpoint:
-
-```
-POST /api/runs/{run_id}/process
-  body:
-    robohack_base:  string (required)  — e.g. "https://robohack.example"
-    ingest_token:   string (required)  — Bearer for /api/robot/splat
-    scene_name:     string?            — defaults to "run-<run_id[:12]>"
-    trainer:        "brush" | "opensplat"     (default brush)
-    steps:          int                       (default 2000)
-    quality:        "low"|"medium"|"high"|"extreme"  (default "low")
-  → 202 { scan_id, queue_depth }
-```
-
-Then poll `GET /scans/{scan_id}` for status (`queued` → `capturing` →
-`poses` → `training` → `pushing` → `ready`).
-
-A **single-worker FIFO queue** serializes every scan (whether it came in
-via `POST /scans` or `POST /api/runs/.../process`) since they all saturate
-the same CPU/GPU. `queue_depth` in the response tells the front-end "you're
-#N in line."
-
-CORS is open (`*`) for hackathon convenience — the front-end at robohack's
-domain can call the ngrok URL cross-origin. Lock down for production.
-
-**Local setup:**
+**On your Mac (running gs-pot):**
 
 ```bash
-./scripts/dev.sh                    # FastAPI on :8000
-# in another shell:
-ngrok http 8000                     # → https://<random>.ngrok.app
-# paste that URL into the robohack front-end; "End run" hits it
+# 1. Python deps + Brush binary — see Install section above.
+
+# 2. .env (gitignored). dev.sh auto-sources it.
+cat > .env <<EOF
+GS_POT_INGEST_TOKEN=<ROBOT_INGEST_TOKEN from robohack/apps/server>
+GS_POT_ROBOHACK_BASE=https://gateway-production-94e2.up.railway.app
+EOF
+
+# 3. Start the server.
+./scripts/dev.sh                       # FastAPI on 127.0.0.1:8000
+
+# 4. Expose via ngrok in a separate terminal.
+ngrok http --url=https://twilight-getting-possum.ngrok-free.dev 8000
+```
+
+**On Railway (web service env):**
+
+```
+NEXT_PUBLIC_GS_POT_URL=https://twilight-getting-possum.ngrok-free.dev
+```
+
+Then trigger a redeploy of the web service so Next.js inlines the var at
+build time. Without it the "Build splat" button is silently hidden.
+
+### The flow, step by step
+
+**1. User opens `/scans` in robohack.**
+
+`apps/web` mounts the `ScansBrowser` component which polls oRPC
+`frames.scans` every 5s. Page renders each run with its position thumbnails.
+If `NEXT_PUBLIC_GS_POT_URL` was baked in at build time, a "Build splat"
+button appears on each run header.
+
+**2. Robot captures frames (concurrent with the page being open).**
+
+For every image the Go2 (or any capture client) takes:
+
+```http
+POST https://gateway-production-94e2.up.railway.app/api/robot/frame
+Authorization: Bearer <ROBOT_INGEST_TOKEN>
+Content-Type: multipart/form-data
+
+  file:     <jpeg bytes>
+  run:      <session-uuid>
+  position: <stop index>     0, 1, 2, …
+  angle:    <heading deg>    0.0, 15.0, 30.0, …
+  poseX:    <robot x>        optional
+  poseY:    <robot y>        optional
+```
+
+apps/server validates the token, writes the JPEG to S3, inserts a row in
+the `frames` table with `run`/`position`/`angle`/`poseX`/`poseY`/`embedding`.
+Responds `200 { "key": "robot/frame_….jpg" }`. The web page picks the new
+frames up on its next 5s poll.
+
+**3. User clicks "Build splat" on a run.**
+
+The React component fires:
+
+```http
+POST https://twilight-getting-possum.ngrok-free.dev/api/runs/<run_id>/process
+Content-Type: application/json
+ngrok-skip-browser-warning: true
+
+{}
+```
+
+Empty body is fine — gs-pot reads `GS_POT_ROBOHACK_BASE` and
+`GS_POT_INGEST_TOKEN` from its `.env`. Browser cannot see those secrets.
+`ngrok-skip-browser-warning` bypasses ngrok-free's HTML interstitial that
+otherwise returns no CORS headers and confuses the React app.
+
+**4. gs-pot accepts the request.**
+
+`gs_pot/server.py`:
+- CORSMiddleware answers the OPTIONS preflight (CORS is open `*`).
+- `process_run(run_id, req)`:
+  - Reads `GS_POT_ROBOHACK_BASE` + `GS_POT_INGEST_TOKEN` from env (body was empty).
+  - Validates both are present — returns `400` with a clear message otherwise.
+  - Auto-creates a `Property` in the in-process store keyed off the run id
+    (`prop_run_<run_id[:12]>`, name `run:<run_id>`).
+  - Mints `scan_id = "scn_<12hex>"`, writes a `ScanInfo{status=queued}` row.
+  - Picks trainer-aware default `steps` (Brush:7000, OpenSplat:2000) if the
+    body didn't override.
+  - Submits the job to `_JobQueue` (single-worker FIFO).
+  - Responds `202 { "scan_id": "scn_…", "queue_depth": N }`.
+
+**5. Front-end starts polling.**
+
+The component flips to "queued" state and polls every 3 s:
+
+```http
+GET https://twilight-getting-possum.ngrok-free.dev/scans/<scan_id>
+ngrok-skip-browser-warning: true
+```
+
+gs-pot returns the live `ScanInfo`:
+
+```json
+{
+  "scan_id": "scn_…", "property_id": "prop_run_…", "scene_name": "run-…",
+  "status": "capturing",
+  "progress": 0.05,
+  "detail": "downloading 12/20",
+  "scene_url": null,
+  "thumb_url": null,
+  "ingest_id": null, "ingest_key": null,
+  "error": null,
+  "created_at": "2026-05-27T…"
+}
+```
+
+The button text follows `status` + `detail`:
+`queued… → capturing… 5% · downloading 12/20 → poses… 10% → training… 40% → pushing… 85% · uploading 6.1 MB`.
+
+**6. Worker thread picks up the job (single-worker FIFO).**
+
+`_process_run_job(scan_id, run_id, robohack_base, ingest_token, …)`:
+
+  a. Patches status to `capturing`, `progress=0.05`, `detail="downloading"`.
+
+  b. Calls `runs.fetch_run(robohack_base, run_id, scenes/<scan_id>/images_src/)`:
+     - `GET <gateway>/api/scans/<run_id>` → JSON tree of positions/images with presigned S3 URLs (6h TTL).
+     - For each image: `GET <presigned-url>` → stream to disk as `p<pos>_a<angle>_<id>.jpg`.
+     - Calls `on_progress(i, n)` after each → patches `detail="downloading 5/20"`.
+     - Skips files already on disk (resume after crash).
+
+  c. Patches `detail=None`, then calls `pipeline.run_scan(scan_id, images_src, …)`:
+
+     **c.1 Poses (`gs_pot/poses.py`)** — patches `status=poses`, `progress=0.1`:
+       - Per-file symlinks every real `.jpg/.png` into `scenes/<scan_id>/images/`,
+         skipping `.DS_Store` and hidden dirs.
+       - `pycolmap.extract_features` (CPU, SIMPLE_RADIAL camera, 2048 SIFT features at `low`).
+       - `pycolmap.match_exhaustive` (CPU).
+       - `pycolmap.incremental_mapping` → `sparse/0/{cameras,images,points3D}.bin`.
+       - `_align_to_gravity(sparse/0)` rotates so cameras' mean "down" maps to world −Y.
+       - We use **pycolmap, not the `colmap` CLI** — homebrew's macOS arm64
+         COLMAP has a deterministic SIFT-matcher SIGSEGV.
+
+     **c.2 Training (`gs_pot/train.py`)** — patches `status=training`, `progress=0.4`:
+       - Spawns `bin/brush <workspace> --total-steps N --export-name scene.ply`.
+       - Wall time on M4 Max: ~3 min for 5k steps, ~30 min for 15k steps
+         (the per-step cost grows as Brush densifies).
+       - Writes `scenes/<scan_id>/scene.ply`.
+
+     **c.3 Push back to robohack (`gs_pot/ingest.py`)** — patches
+     `status=pushing`, `progress=0.85`:
+       - Builds `name = "<property name> · <scene name>"`, e.g. `"run:scan-…" · "run-scan-1779879441"`.
+       - For each attempt (up to 4):
+         - Patches `detail="uploading 6.1 MB"` (or `"… (retry 2/4)"`).
+         - `POST <gateway>/api/robot/splat` multipart `{file, format, name}` with `Authorization: Bearer <token>`.
+         - **Retries** on 502/503/504, ConnectError, ReadTimeout, RemoteProtocolError with exponential backoff (2 s, 4 s, 8 s).
+         - **Does not retry** on 401/403/400/413/415 (deliberate refusals).
+         - On 200 `{ id: "splat_…", key: "splats/….ply" }`: patches `ingest_id` and `ingest_key` on the scan.
+
+     **c.4 Thumbnail (`gs_pot/thumb.py`)** — first image → `scenes/<scan_id>/thumb.jpg` (512px JPEG).
+
+     **c.5 Done** — patches `status=ready`, `progress=1.0`,
+     `scene_url=/scenes/<scan_id>.ply`, `thumb_url=/scenes/<scan_id>/thumb.jpg`.
+
+**7. Front-end sees `status=ready`.**
+
+The polling effect stops, button flips to a green
+`View splat ↗` link pointing at
+`https://twilight-getting-possum.ngrok-free.dev/web/?scene=/scenes/<scan_id>.ply`.
+
+**8. User clicks "View splat".**
+
+New tab loads gs-pot's static viewer (`web/index.html` + `web/viewer.js`).
+Spark + Three.js + WebXR load from CDN via importmap. The viewer reads
+`?scene=…` and calls `new SplatMesh({ url })` against gs-pot's
+`/scenes/<scan_id>.ply` route, which is a `FileResponse` of the binary.
+On Quest 3 / Vision Pro browser the "Enter VR" button appears top-right.
+
+**9. Meanwhile, the splat also lives in robohack.**
+
+Because step 6.c.3 pushed it, apps/server stored it in S3 (`splats/<id>.ply`)
+and inserted a row in the `splats` table. The oRPC `splats.list` procedure
+serves it to wherever the front-end lists splats — typically with a long
+presigned URL TTL so embedded viewers stay valid.
+
+### What you should see in `./scripts/dev.sh`
+
+Restart the server first so it picks up `logging.basicConfig` — without that
+the `gs_pot.*` loggers silently drop (uvicorn only configures its own
+`uvicorn.*` loggers).
+
+```
+2026-05-27 08:45:00 INFO  uvicorn.error           Uvicorn running on http://127.0.0.1:8000
+2026-05-27 08:45:01 INFO  uvicorn.access          204.188.233.66:0 - "OPTIONS /api/runs/scan-…/process HTTP/1.1" 200 OK
+2026-05-27 08:45:01 INFO  uvicorn.access          204.188.233.66:0 - "POST /api/runs/scan-…/process HTTP/1.1" 202 Accepted
+2026-05-27 08:45:01 INFO  gs_pot.runs             fetching run scan-… from https://gateway-…/api/scans/scan-…
+2026-05-27 08:45:02 INFO  gs_pot.runs             run scan-…: 120 frames to fetch
+2026-05-27 08:45:14 INFO  gs_pot.runs             run scan-…: 120 frames in scenes/scn_…/images_src
+2026-05-27 08:45:14 INFO  gs_pot.poses            staged 120 images at scenes/scn_…/images
+2026-05-27 08:45:14 INFO  gs_pot.poses            pycolmap: extract_features (max_image_size=1000, max_features=2048, camera=SIMPLE_RADIAL)
+2026-05-27 08:45:18 INFO  gs_pot.poses            pycolmap: match_exhaustive (guided=False)
+2026-05-27 08:45:22 INFO  gs_pot.poses            pycolmap: incremental_mapping
+2026-05-27 08:45:25 INFO  gs_pot.poses            COLMAP sparse model: scenes/scn_…/sparse/0 (1 reconstruction(s) total)
+2026-05-27 08:45:25 INFO  gs_pot.poses            gravity-align: rotated 120 cameras + N points (|mean down|=0.97)
+2026-05-27 08:45:25 INFO  gs_pot.train            running: bin/brush scenes/scn_… --total-steps 7000 …
+2026-05-27 08:50:30 INFO  gs_pot.train            Brush exported: scenes/scn_…/scene.ply
+2026-05-27 08:50:30 INFO  gs_pot.ingest           pushing scene.ply (6.1 MB) → https://gateway-…/api/robot/splat  [up to 4 attempts]
+2026-05-27 08:50:33 WARN  gs_pot.ingest           push got 502 on attempt 1/4, retrying in 2.0s
+2026-05-27 08:50:37 INFO  gs_pot.ingest           ingest accepted on attempt 2/4: id=splat_… key=splats/….ply
+2026-05-27 08:50:37 INFO  gs_pot.thumb            thumbnail: scenes/scn_…/thumb.jpg
+2026-05-27 08:50:37 INFO  gs_pot.pipeline         [scn_…] DONE
+```
+
+### Failure modes + recovery (lessons learned)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `502 Bad Gateway` mid-push | Railway edge proxy hiccup on large multipart upload | Retry-with-backoff in `push_splat` handles it; if it survives 4 attempts, manually re-push the on-disk `.ply` with curl |
+| `GET /api/scans/<run>` returns Next.js 404 HTML | Old Caddyfile didn't route `/api/scans*` to apps/server | Fixed on robohack master; redeploy gateway |
+| Brush panic `min > max, or either was NaN` | Webhook defaulted `steps=2000`; Brush's lr schedule needs ≥ ~5000 | Fixed: trainer-aware default (Brush:7000, OpenSplat:2000) |
+| `httpx.ConnectError: connection refused` in worker logs during tests | Tests post to a fake `localhost:9999`; queue worker logs the expected failure after the test's assertion | Cosmetic; ignore |
+| CORS error in browser, response is HTML | ngrok-free interstitial; missing `ngrok-skip-browser-warning` header | Already set in `scans-browser.tsx` fetches |
+| Reconstruction is rotated 90° | iPhone photos with EXIF rotation not baked, or COLMAP's gravity prior wrong | `scan-room.sh` runs `PIL.ImageOps.exif_transpose`; `poses._align_to_gravity` rotates the sparse model |
+| Bathroom / mirror / tile scene shows mostly floaters | SfM-hostile scene; only a couple images registered | Pick a textured room. Bathrooms are the worst case |
+| `--quality medium` rejects all images | At medium we enable `guided_matching`; on weak texture it over-prunes | Drop to `--quality low` or rely on the default we ship |
+| Worker is silent in dev.sh | `gs_pot.*` loggers not configured under uvicorn | `server.py` calls `logging.basicConfig` at import; pin level via `GS_POT_LOG_LEVEL` |
+
+### Endpoint quick-reference
+
+```
+POST /api/runs/{run_id}/process              ← the webhook
+  body (all optional, env fallback exists):
+    robohack_base, ingest_token,
+    trainer ("brush"|"opensplat"), steps, quality, scene_name
+  → 202 { scan_id, queue_depth }
+
+GET  /scans/{scan_id}                        ← live status (poll every 3s)
+  → 200 ScanInfo {
+      status: queued|capturing|poses|training|pushing|ready|error,
+      progress: 0..1,
+      detail: "downloading 5/20" | "uploading 6.1 MB (retry 2/4)" | null,
+      scene_url, thumb_url, ingest_id, ingest_key, error
+    }
+
+GET  /scenes/{scan_id}.ply                   ← static binary (Spark loads this)
+GET  /scenes/{scan_id}/thumb.jpg
+GET  /web/?scene=/scenes/{scan_id}.ply       ← built-in Spark+WebXR viewer
 ```
 
 ## Pushing splats to robohack (env-based, single scan)
