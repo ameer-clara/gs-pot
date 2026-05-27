@@ -53,6 +53,7 @@ def run_scan(
     trainer: TrainerName = "brush",
     ingest_url: str | None = None,
     ingest_token: str | None = None,
+    run_id: str | None = None,
     go2_mode: bool = False,
 ) -> ScanInfo:
     """Run the full pipeline. Mutates the scan in the store as we progress.
@@ -60,6 +61,10 @@ def run_scan(
     `ingest_url`/`ingest_token` override `GS_POT_INGEST_URL`/`GS_POT_INGEST_TOKEN`
     env so per-request webhook calls (e.g. /api/runs/.../process) can target
     robohack with a request-scoped token instead of a shared env secret.
+
+    `run_id` is the scan-run identifier from the robohack `/api/runs/<runId>/
+    process` webhook — when supplied, it is included on the splat upload so
+    robohack can link the splat back to the scan run.
 
     Raises on failure (and writes status=error to the store before re-raising).
     """
@@ -86,6 +91,7 @@ def run_scan(
                 ingest_url=push_url,
                 token=push_token,
                 name=label,
+                run_id=run_id,
                 on_progress=lambda text: _set_detail(scan_id, text),
             )
             _patch(

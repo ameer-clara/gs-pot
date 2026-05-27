@@ -8,6 +8,10 @@ Contract (verified against robohack `app/apps/server/src/http/robot.ts:68`):
         file:    binary .ply/.spz/.splat/.ksplat/.sog  (max 256 MB server-side)
         format:  optional; else derived from filename extension
         name:    optional human label
+        runId:   optional scan-run identifier — when present, robohack
+                 persists it on splats.runId so the /scans page's "View
+                 splat" button routes to the in-app viewer instead of
+                 gs-pot's local viewer URL.
     → 200 application/json
         { "key": "splats/<id>.ply", "id": "splat_..." }
 
@@ -51,6 +55,7 @@ def push_splat(
     ingest_url: str,
     token: str,
     name: str | None = None,
+    run_id: str | None = None,
     timeout: float = 600.0,
     max_retries: int = 3,
     base_backoff: float = 2.0,
@@ -103,6 +108,13 @@ def push_splat(
                     data: dict[str, str] = {"format": ext}
                     if name:
                         data["name"] = name
+                    if run_id:
+                        # Links the splat back to the originating scan run.
+                        # Robohack's handleRobotSplat persists this on
+                        # splats.runId so the /scans "View splat" button can
+                        # route to the in-app viewer instead of gs-pot's
+                        # local viewer URL.
+                        data["runId"] = run_id
                     r = client.post(
                         ingest_url,
                         headers={"Authorization": f"Bearer {token}"},
