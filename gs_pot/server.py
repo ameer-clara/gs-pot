@@ -28,6 +28,7 @@ from .models import (
     CreatePropertyResponse,
     CreateScanRequest,
     CreateScanResponse,
+    PoseMode,
     ProcessRunRequest,
     ProcessRunResponse,
     Property,
@@ -232,8 +233,14 @@ def _process_run_job(
     trainer: str,
     steps: int,
     quality: str,
+    mode: str = "colmap",
 ) -> None:
-    """Pull a robohack run's frames, train a splat, push the .ply back."""
+    """Pull a robohack run's frames, train a splat, push the .ply back.
+
+    `mode` ∈ {"colmap", "lidar"} routes the pose-recovery step. `lidar`
+    additionally pulls the LiDAR cloud + per-frame poses from robohack
+    and skips pycolmap SfM; see `pipeline.run_scan` for details.
+    """
     images_src = SCENES_DIR / scan_id / "images_src"
 
     def _patch_status(**changes: Any) -> None:
@@ -262,6 +269,9 @@ def _process_run_job(
             trainer=trainer,  # type: ignore[arg-type]
             ingest_url=f"{robohack_base.rstrip('/')}/api/robot/splat",
             ingest_token=ingest_token,
+            run_id=run_id,
+            mode=PoseMode(mode),
+            robohack_base=robohack_base,
             go2_mode=True,  # webhook flow == Go2 capture: single camera, low-res, wide FOV
         )
     except Exception as exc:
@@ -341,6 +351,7 @@ def process_run(run_id: str, req: ProcessRunRequest) -> ProcessRunResponse:
         trainer=req.trainer.value,
         steps=steps,
         quality=req.quality,
+        mode=req.mode.value,
     )
     return ProcessRunResponse(scan_id=scan_id, queue_depth=depth)
 
