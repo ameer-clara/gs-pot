@@ -262,6 +262,7 @@ def _process_run_job(
             trainer=trainer,  # type: ignore[arg-type]
             ingest_url=f"{robohack_base.rstrip('/')}/api/robot/splat",
             ingest_token=ingest_token,
+            go2_mode=True,  # webhook flow == Go2 capture: single camera, low-res, wide FOV
         )
     except Exception as exc:
         log.exception("[%s] run %s processing failed", scan_id, run_id)

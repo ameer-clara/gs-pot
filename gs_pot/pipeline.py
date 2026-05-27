@@ -53,6 +53,7 @@ def run_scan(
     trainer: TrainerName = "brush",
     ingest_url: str | None = None,
     ingest_token: str | None = None,
+    go2_mode: bool = False,
 ) -> ScanInfo:
     """Run the full pipeline. Mutates the scan in the store as we progress.
 
@@ -65,8 +66,8 @@ def run_scan(
     workspace = scenes_dir / scan_id
     try:
         _patch(scan_id, status=ScanStatus.POSES, progress=0.1)
-        log.info("[%s] colmap start: images=%s workspace=%s", scan_id, images_dir, workspace)
-        run_colmap(workspace, images_dir, quality=quality)
+        log.info("[%s] colmap start: images=%s workspace=%s go2_mode=%s", scan_id, images_dir, workspace, go2_mode)
+        run_colmap(workspace, images_dir, quality=quality, go2_mode=go2_mode)
 
         _patch(scan_id, status=ScanStatus.TRAINING, progress=0.4)
         log.info("[%s] %s start: steps=%d", scan_id, trainer, steps)

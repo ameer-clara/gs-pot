@@ -60,6 +60,14 @@ _QUALITY_PRESETS: dict[Quality, dict[str, Any]] = {
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
+# Minimum SfM output we'll accept before handing off to Brush. Below these
+# thresholds the reconstruction is too degenerate to train on, and Brush
+# panics deep in Rust with `min > max, NaN` (clamp on zero scene scale).
+# Fail loudly with a useful message here instead.
+_MIN_REG_IMAGES = 10
+_MIN_3D_POINTS = 50
+_MIN_SCENE_DIAGONAL = 0.01
+
 
 def _stage_images(image_dir: Path, workspace_images: Path) -> int:
     """Per-file symlink every real image from `image_dir` into `workspace_images`.
@@ -142,12 +150,39 @@ def _align_to_gravity(sparse_dir: Path) -> None:
     )
 
 
+def _check_reconstruction_sane(sparse_dir: Path, input_image_count: int) -> None:
+    """Raise with a useful message if the SfM output is too degenerate for Brush."""
+    rec = pycolmap.Reconstruction(str(sparse_dir))
+    reg = rec.num_reg_images()
+    n_pts = rec.num_points3D()
+    diag = 0.0
+    if n_pts > 0:
+        coords = np.array([p.xyz for p in rec.points3D.values()])
+        diag = float(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)))
+    if reg < _MIN_REG_IMAGES or n_pts < _MIN_3D_POINTS or diag < _MIN_SCENE_DIAGONAL:
+        raise RuntimeError(
+            "SfM reconstruction too degenerate to train a splat from. "
+            f"registered={reg}/{input_image_count} images, "
+            f"3D points={n_pts}, scene diagonal={diag:.4f}. "
+            "Likely causes: pure-rotation capture (no baseline → can't "
+            "triangulate), weak texture (mirrors / glass / blank walls), "
+            "too few angles per stop, low-resolution frames, or motion "
+            "blur. Try a textured scene with more overlap between "
+            "consecutive shots."
+        )
+    log.info(
+        "SfM sanity: registered=%d/%d points=%d diagonal=%.3f — passing to trainer",
+        reg, input_image_count, n_pts, diag,
+    )
+
+
 def run_colmap(
     workspace: Path,
     image_dir: Path,
     *,
     quality: Quality = "medium",
     single_camera: bool = False,
+    go2_mode: bool = False,
 ) -> Path:
     """Run COLMAP via pycolmap. Returns the sparse model dir.
 
@@ -169,7 +204,18 @@ def run_colmap(
         )
     log.info("staged %d images at %s", n_linked, workspace_images)
 
-    preset = _QUALITY_PRESETS[quality]
+    preset = dict(_QUALITY_PRESETS[quality])
+    # Go2 mode: same physical camera every shot, wider FOV, 640×360 frames.
+    # Override the preset to the proven scan-go2.py settings. Keeps existing
+    # phone-photo flows untouched.
+    if go2_mode:
+        preset["camera_model"] = "OPENCV"
+        preset["max_image_size"] = max(preset["max_image_size"], 1024)
+        preset["max_num_features"] = max(preset["max_num_features"], 16384)
+        preset["guided_matching"] = True
+        single_camera = True
+        log.info("Go2 mode: OPENCV/SINGLE camera, 16k features, guided matching")
+
     database = workspace / "database.db"
     if database.exists():
         database.unlink()
@@ -212,6 +258,14 @@ def run_colmap(
     map_opts = pycolmap.IncrementalPipelineOptions()
     map_opts.ba_local_max_num_iterations = preset["ba_local_max_num_iterations"]
     map_opts.ba_global_max_num_iterations = preset["ba_global_max_num_iterations"]
+    if go2_mode:
+        # Narrow-baseline rotation-heavy captures need lenient registration
+        # thresholds; mirrors scripts/scan-go2.py.
+        map_opts.min_model_size = 3
+        map_opts.min_num_matches = 10
+        map_opts.mapper.init_min_num_inliers = 30
+        map_opts.mapper.abs_pose_min_num_inliers = 10
+        map_opts.mapper.init_min_tri_angle = 1.0
     reconstructions = pycolmap.incremental_mapping(
         database_path=database,
         image_path=workspace_images,
@@ -240,6 +294,7 @@ def run_colmap(
         "COLMAP sparse model: %s (%d reconstruction(s) total, kept largest)",
         best, len(reconstructions),
     )
+    _check_reconstruction_sane(best, n_linked)
     _align_to_gravity(best)
     return best
 
