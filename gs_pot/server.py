@@ -262,6 +262,7 @@ def _process_run_job(
             trainer=trainer,  # type: ignore[arg-type]
             ingest_url=f"{robohack_base.rstrip('/')}/api/robot/splat",
             ingest_token=ingest_token,
+            run_id=run_id,  # threaded to push_splat → robohack splats.runId
             go2_mode=True,  # webhook flow == Go2 capture: single camera, low-res, wide FOV
         )
     except Exception as exc:
