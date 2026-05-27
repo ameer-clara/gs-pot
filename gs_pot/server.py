@@ -35,6 +35,7 @@ from .models import (
     ScanInfo,
     ScanSource,
     ScanStatus,
+    Trainer,
 )
 from .pipeline import run_scan
 from .runs import fetch_run
@@ -323,6 +324,13 @@ def process_run(run_id: str, req: ProcessRunRequest) -> ProcessRunResponse:
         )
     )
 
+    # Trainer-aware steps default. Brush's learning-rate schedule panics
+    # (`min > max`) when total_steps is much below ~5000; OpenSplat is fine
+    # at 2000. Caller can still override either by passing `steps` in the body.
+    steps = req.steps if req.steps is not None else (
+        2000 if req.trainer == Trainer.OPENSPLAT else 7000
+    )
+
     depth = _job_queue.submit(
         _process_run_job,
         scan_id=scan_id,
@@ -330,7 +338,7 @@ def process_run(run_id: str, req: ProcessRunRequest) -> ProcessRunResponse:
         robohack_base=robohack_base,
         ingest_token=ingest_token,
         trainer=req.trainer.value,
-        steps=req.steps,
+        steps=steps,
         quality=req.quality,
     )
     return ProcessRunResponse(scan_id=scan_id, queue_depth=depth)

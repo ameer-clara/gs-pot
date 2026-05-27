@@ -119,7 +119,11 @@ class ProcessRunRequest(BaseModel):
     ingest_token: str | None = Field(default=None, description="overrides GS_POT_INGEST_TOKEN")
     scene_name: str | None = Field(default=None, max_length=128)
     trainer: Trainer = Trainer.BRUSH
-    steps: int = Field(default=2000, ge=500, le=60000)
+    # `steps` defaults to None — server picks a trainer-appropriate default
+    # (Brush:7000, OpenSplat:2000). Brush panics with `min > max` in its lr
+    # schedule when total_steps drops much below ~5000; OpenSplat converges
+    # ~3× faster per iteration so 2000 is its sweet spot.
+    steps: int | None = Field(default=None, ge=500, le=60000)
     quality: str = Field(default="low", pattern=r"^(low|medium|high|extreme)$")
 
 

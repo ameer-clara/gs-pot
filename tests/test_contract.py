@@ -290,6 +290,21 @@ def test_process_run_accepts_trainer_and_quality_overrides(client: TestClient) -
     assert r.status_code == 202
 
 
+def test_process_run_steps_optional_defaults_per_trainer(client: TestClient) -> None:
+    """Body without `steps` → server picks Brush:7000 / OpenSplat:2000.
+    Brush panics on total_steps<~5000, so the default has to be trainer-aware."""
+    for trainer, _expected in (("brush", 7000), ("opensplat", 2000)):
+        r = client.post(
+            "/api/runs/r/process",
+            json={
+                "robohack_base": "http://localhost:9999",
+                "ingest_token": "t",
+                "trainer": trainer,
+            },
+        )
+        assert r.status_code == 202, (trainer, r.text)
+
+
 def test_cors_preflight_open(client: TestClient) -> None:
     """Front-end at robohack's domain must be able to POST cross-origin."""
     r = client.options(
