@@ -2,7 +2,14 @@ import * as THREE from "three";
 import { SparkRenderer, SplatMesh, SparkControls, SparkXr } from "@sparkjsdev/spark";
 
 const DEFAULT_SCENE = "https://storage.googleapis.com/forge-dev-public/asundqui/cozy-xr/cozy_cottage-lod.spz";
-const sceneUrl = new URLSearchParams(location.search).get("scene") || DEFAULT_SCENE;
+const params = new URLSearchParams(location.search);
+const sceneUrl = params.get("scene") || DEFAULT_SCENE;
+// COLMAP's world frame is arbitrary — rx/ry/rz (degrees) let you align
+// gravity with -Y without retraining. e.g. ?scene=...&rx=-90&rz=180
+const degToRad = (s) => ((parseFloat(s) || 0) * Math.PI) / 180;
+const rotX = degToRad(params.get("rx"));
+const rotY = degToRad(params.get("ry"));
+const rotZ = degToRad(params.get("rz"));
 
 const RENDER_TIMEOUT_MS = 30_000;
 
@@ -30,6 +37,7 @@ localFrame.add(camera);
 
 const world = new SplatMesh({ url: sceneUrl });
 world.position.set(0, -1, 0);
+world.rotation.set(rotX, rotY, rotZ);
 scene.add(world);
 
 const controls = new SparkControls({ renderer, canvas: renderer.domElement });

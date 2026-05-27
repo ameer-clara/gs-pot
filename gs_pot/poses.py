@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import pycolmap
 
 log = logging.getLogger(__name__)
@@ -82,6 +83,63 @@ def _stage_images(image_dir: Path, workspace_images: Path) -> int:
         dst.symlink_to(src.resolve())
         n += 1
     return n
+
+
+def _rotation_to_align(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """Rotation matrix that maps unit vector `src` onto unit vector `dst` (Rodriguez)."""
+    src = src / np.linalg.norm(src)
+    dst = dst / np.linalg.norm(dst)
+    v = np.cross(src, dst)
+    c = float(np.dot(src, dst))
+    if c > 1 - 1e-8:
+        return np.eye(3)
+    if c < -1 + 1e-8:
+        # 180° — rotate around any axis perpendicular to src.
+        axis = np.array([1.0, 0, 0]) if abs(src[0]) < 0.9 else np.array([0, 1.0, 0])
+        axis = axis - np.dot(axis, src) * src
+        axis /= np.linalg.norm(axis)
+        return 2 * np.outer(axis, axis) - np.eye(3)
+    k = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + k + k @ k * ((1 - c) / float(np.dot(v, v)))
+
+
+def _align_to_gravity(sparse_dir: Path) -> None:
+    """Rotate the reconstruction in-place so the cameras' average 'down' axis
+    aligns with world -Y (Three.js / Spark up-convention).
+
+    COLMAP/OpenCV camera frame: +X right, +Y down, +Z forward. So the camera's
+    'down' direction in world space is the second row of R_w2c. Averaging
+    across all registered images gives a robust gravity estimate when the
+    user shot the scene roughly upright — which is the common case for both
+    iPhone walkthroughs and a Go2 with a horizontally-mounted head.
+    """
+    rec = pycolmap.Reconstruction(str(sparse_dir))
+    poses = [img.cam_from_world() for img in rec.images.values() if img.has_pose]
+    if not poses:
+        log.warning("gravity-align: no registered poses, skipping")
+        return
+
+    down_world = np.stack([p.rotation.matrix()[1, :] for p in poses])
+    gravity = down_world.mean(axis=0)
+    norm = float(np.linalg.norm(gravity))
+    if norm < 0.3:
+        # Cameras pointing in wildly different directions — gravity not
+        # recoverable from the up-axis heuristic. Bail without rotating.
+        log.warning(
+            "gravity-align: weak signal (|mean down|=%.2f over %d poses); skipping",
+            norm, len(poses),
+        )
+        return
+    gravity /= norm
+
+    R = _rotation_to_align(gravity, np.array([0.0, -1.0, 0.0]))
+    sim3d = pycolmap.Sim3d(1.0, pycolmap.Rotation3d(R), np.zeros(3))
+    rec.transform(sim3d)
+    rec.write(str(sparse_dir))
+    log.info(
+        "gravity-align: rotated %d cameras + %d points (|mean down|=%.2f)",
+        len(poses), len(rec.points3D), norm,
+    )
 
 
 def run_colmap(
@@ -172,6 +230,7 @@ def run_colmap(
         "COLMAP sparse model: %s (%d reconstruction(s) total)",
         models[0], len(reconstructions),
     )
+    _align_to_gravity(models[0])
     return models[0]
 
 

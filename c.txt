@@ -1,0 +1,18 @@
+so the main repo posts images to https://gateway-production-94e2.up.railway.app/frames our teammate will
+  do git clone 3 times and run it locally, do we just pull images from there? best strategy?
+
+
+  why can't we use my m4 max's gpu, do i have to install something to make it work? 
+
+
+  and the imagees are inversed, IMG_9999 is first and IMG_0001 is the last, i.e img_0001 is the most recent
+  image (and the last one). i walked from the bathroom out to the corridor
+
+
+  it rendered something cool, does the image name sequence matter, IMG_0011.jpg is the first and 
+  IMG_0003.jpg during the walk 
+
+
+  kill it, research online and tell me me the best way to do this on m4 using th 48 core gpu that i have,
+  the image quality was off i just walked straight. now i took a video in a circular fashion and the new
+  video script cut it and its it 

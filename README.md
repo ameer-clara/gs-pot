@@ -84,27 +84,87 @@ For Linux x86_64 / Windows, swap the Brush release filename — see
 ### 2. Run the pipeline
 
 ```bash
+# Default (Brush trainer, medium COLMAP):
 uv run python -m gs_pot scan \
     --images ./photos/living_room \
     --property-name "My Apt" \
     --scene-name "living_room"
+
+# Same thing via the wrapper script (also converts HEIC):
+./scripts/scan-room.sh living_room "My Apt"
+
+# Faster trainer (once OpenSplat is built — see bin/README.md):
+./scripts/scan-room.sh living_room "My Apt" --trainer opensplat --steps 2000
 ```
 
 Knobs:
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--quality {low,medium,high,extreme}` | `medium` | COLMAP preset. `low` is much faster, useful for first iterations. |
-| `--steps N` | `7000` | Brush training iterations. `5000` faster; `15000` sharper. |
+| `--trainer {brush,opensplat}` | `brush` | See [Trainer choice](#trainer-choice-brush-vs-opensplat) below. |
+| `--quality {low,medium,high,extreme}` | `medium` | COLMAP preset. See [Quality presets](#quality-presets). |
+| `--steps N` | trainer default | Brush: `7000`. OpenSplat: `2000`. |
 | `--scenes-dir PATH` | `./scenes` | Where the workspace + outputs land. |
 
 Output:
 
 - `scenes/<scan_id>/scene.ply` — the Gaussian splat
 - `scenes/<scan_id>/thumb.jpg` — thumbnail
-- The CLI prints a viewer URL when it's done.
+- The CLI prints a viewer URL **and a summary table** with registered-image
+  count, 3D-point count, splat count, .ply size, and wall time.
 
-Expected wall time on an M4 Max with ~100 photos, `--quality medium --steps 7000`: roughly **5–15 minutes** end-to-end (COLMAP dominates).
+Expected wall time on an M4 Max with ~30–100 photos, `--quality medium`:
+- Brush, 7k steps: ~10–30 min
+- OpenSplat, 2k steps: ~3–8 min  (3–5× faster)
+
+COLMAP poses are fast (<10 s for 30 photos at `low`); training dominates total time.
+
+## Trainer choice (Brush vs OpenSplat)
+
+Both trainers consume the same COLMAP workspace (`images/` + `sparse/0/*.bin`)
+and emit a standard `.ply` Spark can read. They're swappable per-scan via
+`--trainer`.
+
+| Concern | Brush 0.3.0 | OpenSplat |
+|---|---|---|
+| Backend | Rust / WGPU → Metal | C++ / libtorch native Metal |
+| Install | release binary in `bin/brush` (works out of the box) | `brew install cmake opencv pytorch` + cmake build, ~10–20 min one-time (see `bin/README.md`) |
+| Cross-platform | macOS / Linux / Windows | macOS (MPS) + Linux/Windows (CUDA, ROCm) |
+| Speed on M4 Max | 15k steps ≈ 29 min (measured on 9 photos) | 2k steps ≈ ~5 min (3–5× faster reported) |
+| Step semantics | gradient steps; converges at 5k–15k | "n iterations"; converges at 2k–5k |
+| Default `--steps` | 7000 | 2000 |
+| License | Apache-2.0 + MIT | AGPLv3 (commercial use OK) |
+
+**When to use which:**
+- **Brush** is the default — always works, no build step. Use it on a fresh
+  laptop, in CI, or for sanity-check scans.
+- **OpenSplat** is the speed path. Use it once you're iterating (more photos,
+  more reruns, more demos). It's also what we'd ship to the venue laptop on
+  hackathon day 1 — same Metal backend on Mac, native CUDA on the Linux box.
+
+Override the binary location with `BRUSH_BIN=` / `OPENSPLAT_BIN=` env vars
+if you put them somewhere other than `bin/`.
+
+## Quality presets
+
+The `--quality` flag drives COLMAP's SfM, not the splat trainer. It controls
+how aggressive feature extraction + bundle adjustment are. Tuned for the
+real-estate scan use case (room-scale, mixed lighting):
+
+| Preset | Image size | Max SIFT features | Guided matching | BA iters (local / global) | When |
+|---|---|---|---|---|---|
+| `low`     | 1000 px | 2048  | off | 12 / 30  | first-pass smoke test; **safe on low-texture scenes (bathrooms, white walls)** |
+| `medium`  | 1600 px | 8192  | off | 16 / 50  | default; what most rooms want |
+| `high`    | 2400 px | 16384 | on  | 25 / 75  | textured rooms with many photos; slower SfM |
+| `extreme` | 3200 px | 32768 | on  | 40 / 100 | maximum quality, OPENCV (5-param) camera model |
+
+**Important counter-intuitive note:** for weak-texture scenes (bathrooms,
+white walls, tile, mirrors), `low` often **registers more images than
+`medium`+`high`**. The higher presets enable `guided_matching`, which prunes
+matches that don't fit the initial epipolar geometry — but the initial
+geometry on weak features is noisy, so guided matching over-prunes and the
+mapper can fail to find an initial image pair. Start with `low` on tricky
+scenes, then promote if everything registers cleanly.
 
 ### 3. View it
 
@@ -129,26 +189,46 @@ http://localhost:8000/web/?scene=/scenes/<scan_id>.ply
 `scan-room.sh` orchestrates the full producer side:
 
 ```
-./scripts/scan-room.sh <room> "<property-name>"
+./scripts/scan-room.sh <room> "<property-name>" [--trainer brush|opensplat] [--steps N] [--quality low|medium|high|extreme]
     │
-    ├─ HEIC → JPG conversion (sips, ffmpeg fallback)
+    ├─ HEIC → JPG conversion (sips, ffmpeg fallback)  ── skipped if no .HEIC
+    ├─ count images, fail loudly if 0
     └─ exec  uv run python -m gs_pot scan ...
                 │
-                ├─ A. POSES        — pycolmap.extract_features
-                │                    pycolmap.match_exhaustive
-                │                    pycolmap.incremental_mapping
-                │                    → scenes/<id>/sparse/0/*.bin
-                │
-                ├─ B. TRAINING     — bin/brush <workspace> --total-steps N
-                │                    → scenes/<id>/scene.ply
-                │
-                ├─ C. PUSH         — POST to robohack `/api/robot/splat`
-                │                    (skipped if GS_POT_INGEST_URL unset)
-                │
-                ├─ D. THUMBNAIL    — first image → scenes/<id>/thumb.jpg
-                │
-                └─ E. READY        — scan status flipped to "ready" in store,
-                                     scene_url=/scenes/<id>.ply
+                ▼  Python pipeline (gs_pot/pipeline.py)
+        ┌───────────────────────────────────────────────────────┐
+        │ A. POSES   — gs_pot/poses.py                          │
+        │    • symlink every real image (.jpg/.png) into        │
+        │      scenes/<id>/images/ (filters out .DS_Store etc.) │
+        │    • pycolmap.extract_features                        │
+        │    • pycolmap.match_exhaustive                        │
+        │    • pycolmap.incremental_mapping                     │
+        │    → scenes/<id>/sparse/0/{cameras,images,points3D}.bin│
+        ├───────────────────────────────────────────────────────┤
+        │ B. TRAINING — gs_pot/train.py (dispatched by trainer) │
+        │    --trainer brush     →  bin/brush <ws>  --total-steps N            │
+        │    --trainer opensplat →  bin/opensplat <ws>  -n N  -o scene.ply     │
+        │    → scenes/<id>/scene.ply                            │
+        ├───────────────────────────────────────────────────────┤
+        │ C. PUSH    — gs_pot/ingest.py (optional)              │
+        │    if GS_POT_INGEST_URL + TOKEN set:                  │
+        │      POST .ply to robohack /api/robot/splat (Bearer)  │
+        │      → records ingest_id, ingest_key on the scan      │
+        ├───────────────────────────────────────────────────────┤
+        │ D. THUMB   — gs_pot/thumb.py                          │
+        │    first image → scenes/<id>/thumb.jpg                │
+        ├───────────────────────────────────────────────────────┤
+        │ E. READY   — store status flipped to "ready",         │
+        │              scene_url=/scenes/<id>.ply               │
+        └───────────────────────────────────────────────────────┘
+```
+
+Status flow (read by `GET /scans/<id>`):
+
+```
+queued ──▶ poses ──▶ training ──▶ pushing* ──▶ ready
+                │                              ↑
+                └─────────── error ◀───────────┘   (* skipped if no ingest config)
 ```
 
 Output sitting on disk for each scan:

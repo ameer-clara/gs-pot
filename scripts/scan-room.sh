@@ -57,6 +57,27 @@ if [ ${#heic_files[@]} -gt 0 ]; then
     done
 fi
 
+# Apply EXIF orientation physically — iPhone JPGs ship as landscape pixels
+# with a "rotate" tag that COLMAP ignores, producing sideways reconstructions.
+cd "$REPO"
+uv run python -c "
+import sys
+from pathlib import Path
+from PIL import Image, ImageOps
+n = 0
+for p in Path('$IMAGES').iterdir():
+    if p.suffix.lower() not in {'.jpg', '.jpeg', '.png'}:
+        continue
+    img = Image.open(p)
+    if img.getexif().get(0x0112, 1) == 1:
+        continue
+    ImageOps.exif_transpose(img).save(p, quality=95)
+    n += 1
+if n:
+    print(f'▶ auto-oriented {n} image(s) via EXIF')
+"
+cd "$IMAGES"
+
 img_count=$(find . -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l | tr -d ' ')
 echo "  $img_count image(s) ready in $IMAGES"
 

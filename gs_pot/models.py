@@ -21,6 +21,14 @@ class ScanSource(str, Enum):
     DIMOS_REPLAY = "dimos_replay"
 
 
+class Trainer(str, Enum):
+    """Gaussian splat trainer. Brush is the default — slow but ships in-repo.
+    OpenSplat is the opt-in faster path; needs a one-time cmake build."""
+
+    BRUSH = "brush"
+    OPENSPLAT = "opensplat"
+
+
 # ── Property: a group of scans (one apartment / building / listing) ───────────
 
 
@@ -49,6 +57,9 @@ class CreateScanRequest(BaseModel):
     source: ScanSource = ScanSource.IMAGES
     images_dir: str | None = None
     video_path: str | None = None
+    trainer: Trainer = Trainer.BRUSH
+    # `steps` is trainer-specific. Brush converges around 5k–15k. OpenSplat
+    # converges around 2k–5k. We don't auto-rescale; pass an appropriate value.
     steps: int = Field(default=7000, ge=500, le=60000)
     quality: str = Field(default="medium", pattern=r"^(low|medium|high|extreme)$")
 

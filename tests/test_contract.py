@@ -90,6 +90,33 @@ def test_create_scan_rejects_blank_scene_name(client: TestClient, property_id: s
     assert r.status_code == 422
 
 
+def test_create_scan_accepts_trainer_field(client: TestClient, property_id: str) -> None:
+    for trainer in ("brush", "opensplat"):
+        r = client.post(
+            "/scans",
+            json={
+                "property_id": property_id,
+                "scene_name": "x",
+                "source": "images",
+                "trainer": trainer,
+            },
+        )
+        assert r.status_code == 202, (trainer, r.text)
+
+
+def test_create_scan_rejects_unknown_trainer(client: TestClient, property_id: str) -> None:
+    r = client.post(
+        "/scans",
+        json={
+            "property_id": property_id,
+            "scene_name": "x",
+            "source": "images",
+            "trainer": "magic",
+        },
+    )
+    assert r.status_code == 422
+
+
 def test_get_scan_returns_full_status_shape(client: TestClient, property_id: str) -> None:
     sid = client.post(
         "/scans",

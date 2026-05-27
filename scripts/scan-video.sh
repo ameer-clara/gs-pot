@@ -14,8 +14,11 @@
 #   - <property-name> defaults to "Test Apt".
 #   - Frames go into images/<room>/ (created if missing; fails if non-empty
 #     unless --force is passed).
-#   - By default we sample uniformly to land near --target-frames (default 150).
-#     Override with --fps <N> for a fixed extraction rate.
+#   - We oversample (by --oversample, default 3x) then drop blurry frames via
+#     Laplacian-variance scoring, picking the sharpest frame in each timeline
+#     bucket. This handles handheld motion blur without manual culling.
+#   - Override extraction rate with --fps <N>; tune the blur floor with
+#     --min-sharpness <N> (default 50); skip filtering with --no-filter.
 #   - Anything after `--` is forwarded verbatim to `python -m gs_pot scan`.
 #
 # Defaults match scan-room.sh: --quality low --steps 5000.
@@ -54,6 +57,9 @@ fi
 # Local flags consumed by this script (everything else goes to gs_pot scan).
 TARGET_FRAMES=150
 FPS=""
+OVERSAMPLE=10
+MIN_SHARPNESS=120
+FILTER=1
 FORCE=0
 PASSTHRU=()
 
@@ -63,6 +69,12 @@ while [ $# -gt 0 ]; do
             TARGET_FRAMES="$2"; shift 2 ;;
         --fps)
             FPS="$2"; shift 2 ;;
+        --oversample)
+            OVERSAMPLE="$2"; shift 2 ;;
+        --min-sharpness)
+            MIN_SHARPNESS="$2"; shift 2 ;;
+        --no-filter)
+            FILTER=0; shift ;;
         --force)
             FORCE=1; shift ;;
         --)
@@ -101,19 +113,29 @@ if [ -z "$DURATION" ] || [ "$DURATION" = "N/A" ]; then
 fi
 
 if [ -z "$FPS" ]; then
-    # FPS = TARGET_FRAMES / duration, clamped to [0.5, 10].
-    FPS="$(awk -v t="$TARGET_FRAMES" -v d="$DURATION" 'BEGIN {
+    # FPS = (TARGET_FRAMES * OVERSAMPLE) / duration when filtering, else
+    # just TARGET_FRAMES / duration. Clamped to [0.5, 30].
+    EFFECTIVE_TARGET="$TARGET_FRAMES"
+    if [ "$FILTER" -eq 1 ]; then
+        EFFECTIVE_TARGET=$((TARGET_FRAMES * OVERSAMPLE))
+    fi
+    FPS="$(awk -v t="$EFFECTIVE_TARGET" -v d="$DURATION" 'BEGIN {
         f = t / d;
         if (f < 0.5) f = 0.5;
-        if (f > 10)  f = 10;
+        if (f > 30)  f = 30;
         printf "%.4f", f;
     }')"
 fi
 
 printf '▶ extracting frames from %s\n' "$VIDEO_ABS"
-printf '  duration:      %ss\n' "$DURATION"
+printf '  duration:       %ss\n' "$DURATION"
 printf '  extraction fps: %s\n' "$FPS"
-printf '  target frames:  ~%s\n' "$TARGET_FRAMES"
+printf '  target frames:  ~%s' "$TARGET_FRAMES"
+if [ "$FILTER" -eq 1 ]; then
+    printf '  (oversample %sx, then keep sharpest per bucket)\n' "$OVERSAMPLE"
+else
+    printf '  (blur filter disabled)\n'
+fi
 printf '  output:         %s/frame_%%04d.jpg\n' "$IMAGES"
 
 # -vsync vfr drops duplicate frames; -q:v 2 = high-quality JPEG (~95).
@@ -131,11 +153,21 @@ if [ "$img_count" -eq 0 ]; then
     echo "error: no frames extracted from $VIDEO_ABS" >&2
     exit 65
 fi
+
+cd "$REPO"
+
+if [ "$FILTER" -eq 1 ]; then
+    echo
+    echo "▶ filtering blurry frames (Laplacian variance, floor=$MIN_SHARPNESS)"
+    uv run python scripts/select_sharp_frames.py "$IMAGES" \
+        --keep "$TARGET_FRAMES" \
+        --min-score "$MIN_SHARPNESS"
+    img_count=$(find "$IMAGES" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l | tr -d ' ')
+fi
+
 if [ "$img_count" -lt 10 ]; then
     echo "warn: $img_count frames is below the 50–150 recommended; COLMAP may fail to reconstruct" >&2
 fi
-
-cd "$REPO"
 
 echo
 echo "▶ running gs_pot scan  property=\"$PROPERTY\"  scene=\"$ROOM\""

@@ -90,6 +90,7 @@ def _scan_summary(scan_id: str, args: argparse.Namespace, elapsed_s: float) -> N
     rows = [
         ("scene", f"{args.scene_name or args.images.name}"),
         ("property", args.property_name),
+        ("trainer", args.trainer),
         ("quality", args.quality),
         ("steps", str(args.steps)),
         ("registered images", reg_images),
@@ -126,7 +127,19 @@ def _add_scan_parser(sub: argparse._SubParsersAction) -> None:
         default=Path("scenes"),
         help="where to write workspaces + outputs (default: ./scenes)",
     )
-    p.add_argument("--steps", type=int, default=7000, help="Brush training steps")
+    p.add_argument(
+        "--trainer",
+        default="brush",
+        choices=["brush", "opensplat"],
+        help="splat trainer backend. brush=cross-platform/slow (default), "
+             "opensplat=Metal-native/fast (needs build, see bin/README.md)",
+    )
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="trainer iterations. Default: 7000 for brush, 2000 for opensplat.",
+    )
     p.add_argument(
         "--quality",
         default="medium",
@@ -139,6 +152,9 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     if not args.images.exists() or not args.images.is_dir():
         print(f"error: --images is not a directory: {args.images}", file=sys.stderr)
         return 2
+
+    if args.steps is None:
+        args.steps = 2000 if args.trainer == "opensplat" else 7000
 
     property_id = f"prop_{uuid.uuid4().hex[:12]}"
     get_property_store().put(
@@ -167,7 +183,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     print(f"  scan:     {scan_id}  ({scene_name})")
     print(f"  images:   {args.images}")
     print(f"  output:   {args.scenes_dir / scan_id}/scene.ply")
-    print(f"  steps:    {args.steps}  quality: {args.quality}")
+    print(f"  trainer:  {args.trainer}  steps: {args.steps}  quality: {args.quality}")
     print()
 
     t0 = time.monotonic()
@@ -177,6 +193,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
         scenes_dir=args.scenes_dir,
         steps=args.steps,
         quality=args.quality,
+        trainer=args.trainer,
     )
     elapsed = time.monotonic() - t0
 

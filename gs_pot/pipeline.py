@@ -18,7 +18,7 @@ from .models import ScanInfo, ScanStatus
 from .poses import Quality, run_colmap
 from .store import get_property_store, get_store
 from .thumb import make_thumbnail
-from .train import run_brush
+from .train import TrainerName, run_trainer
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ def run_scan(
     scenes_dir: Path,
     steps: int = 7000,
     quality: Quality = "medium",
+    trainer: TrainerName = "brush",
 ) -> ScanInfo:
     """Run the full pipeline. Mutates the scan in the store as we progress.
 
@@ -58,8 +59,8 @@ def run_scan(
         run_colmap(workspace, images_dir, quality=quality)
 
         _patch(scan_id, status=ScanStatus.TRAINING, progress=0.4)
-        log.info("[%s] brush start: steps=%d", scan_id, steps)
-        ply = run_brush(workspace, workspace, steps=steps, export_name="scene.ply")
+        log.info("[%s] %s start: steps=%d", scan_id, trainer, steps)
+        ply = run_trainer(trainer, workspace, workspace, steps=steps, export_name="scene.ply")
 
         # Optional: push to robohack's ingest endpoint if both env vars are set.
         ingest_url = os.environ.get("GS_POT_INGEST_URL")

@@ -79,7 +79,13 @@ def get_property(property_id: str) -> PropertyDetail:
 # ── Scan endpoints ────────────────────────────────────────────────────────────
 
 
-def _kick_pipeline(scan_id: str, images_dir: Path, steps: int, quality: str) -> None:
+def _kick_pipeline(
+    scan_id: str,
+    images_dir: Path,
+    steps: int,
+    quality: str,
+    trainer: str,
+) -> None:
     """Run the pipeline in a background thread. Errors land in the store."""
 
     def _worker() -> None:
@@ -90,6 +96,7 @@ def _kick_pipeline(scan_id: str, images_dir: Path, steps: int, quality: str) -> 
                 scenes_dir=SCENES_DIR,
                 steps=steps,
                 quality=quality,  # type: ignore[arg-type]
+                trainer=trainer,  # type: ignore[arg-type]
             )
         except Exception:
             log.exception("[%s] background pipeline failed", scan_id)
@@ -116,7 +123,7 @@ def create_scan(req: CreateScanRequest) -> CreateScanResponse:
     if req.source == ScanSource.IMAGES and req.images_dir:
         images_dir = Path(req.images_dir)
         if images_dir.is_dir():
-            _kick_pipeline(scan_id, images_dir, req.steps, req.quality)
+            _kick_pipeline(scan_id, images_dir, req.steps, req.quality, req.trainer.value)
         else:
             get_store().put(
                 info.model_copy(
