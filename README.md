@@ -258,7 +258,67 @@ matcher with SIGSEGV. pycolmap's wheels ship their own COLMAP binary built
 via cibuildwheel for darwin-arm64 and don't hit the bug. The Python API is
 also cleaner — no flag-name-by-version churn.
 
-## Pushing splats to robohack (production integration)
+## End-to-end with robohack — `/api/runs/<run_id>/process` webhook
+
+Production flow. Robohack's front-end drives a capture session, then calls
+gs-pot via ngrok to trigger processing on "End run":
+
+```
+[Front-end]   pick run_id (uuid); tell robot to begin
+
+[Go2 + DimOS] POST <robohack>/api/robot/frame   run=<id> position=N angle=θ   (×N images)
+
+[Front-end]   user clicks "End run"
+              │
+              ▼  POST <YOUR_NGROK_URL>/api/runs/<run_id>/process
+                     { robohack_base, ingest_token,
+                       [trainer, steps, quality, scene_name] }
+
+[gs-pot]      202 → { scan_id, queue_depth }
+              ├─ download all frames for run_id from <robohack>/api/scans/<run_id>
+              │  (presigned S3 URLs, 6h TTL — no auth needed)
+              ├─ existing pipeline: HEIC-skip → COLMAP → gravity-align → train
+              └─ POST scene.ply → <robohack>/api/robot/splat   Bearer <ingest_token>
+                     name="run:<run_id>"
+
+[Front-end]   GET <robohack>/api/scans renders the new splat with the run's frames
+```
+
+Endpoint:
+
+```
+POST /api/runs/{run_id}/process
+  body:
+    robohack_base:  string (required)  — e.g. "https://robohack.example"
+    ingest_token:   string (required)  — Bearer for /api/robot/splat
+    scene_name:     string?            — defaults to "run-<run_id[:12]>"
+    trainer:        "brush" | "opensplat"     (default brush)
+    steps:          int                       (default 2000)
+    quality:        "low"|"medium"|"high"|"extreme"  (default "low")
+  → 202 { scan_id, queue_depth }
+```
+
+Then poll `GET /scans/{scan_id}` for status (`queued` → `capturing` →
+`poses` → `training` → `pushing` → `ready`).
+
+A **single-worker FIFO queue** serializes every scan (whether it came in
+via `POST /scans` or `POST /api/runs/.../process`) since they all saturate
+the same CPU/GPU. `queue_depth` in the response tells the front-end "you're
+#N in line."
+
+CORS is open (`*`) for hackathon convenience — the front-end at robohack's
+domain can call the ngrok URL cross-origin. Lock down for production.
+
+**Local setup:**
+
+```bash
+./scripts/dev.sh                    # FastAPI on :8000
+# in another shell:
+ngrok http 8000                     # → https://<random>.ngrok.app
+# paste that URL into the robohack front-end; "End run" hits it
+```
+
+## Pushing splats to robohack (env-based, single scan)
 
 In production gs-pot is **the reconstruction box** for
 [robohack](https://github.com/grmkris/robohack). Their `apps/server` exposes
@@ -378,5 +438,6 @@ differ; see CLAUDE.md for the CUDA-path swap.
 
 ## See also
 
+- [FLOWS.md](./FLOWS.md) — Mermaid sequence diagrams for the CLI, HTTP, and webhook flows + the status state machine.
 - [CLAUDE.md](./CLAUDE.md) — full build plan, pipeline diagram, open decisions, collaboration rules.
 - [robohack][robohack] — parent repo with hackathon strategy + research papers.

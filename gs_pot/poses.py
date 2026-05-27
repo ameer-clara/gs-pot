@@ -226,12 +226,22 @@ def run_colmap(
             "Common causes: too few overlapping images, repetitive textures, "
             "mirrors/glass, motion blur."
         )
+    # COLMAP can output multiple disjoint reconstructions; pick the largest by
+    # registered-camera count. Brush reads `sparse/0/` by convention, so the
+    # picked model must live there.
+    best = max(models, key=lambda d: len(pycolmap.Reconstruction(str(d)).images))
+    if best.name != "0":
+        target = sparse_root / "0"
+        if target.exists():
+            target.rename(sparse_root / f"0.discarded_{target.stat().st_mtime_ns}")
+        best.rename(target)
+        best = target
     log.info(
-        "COLMAP sparse model: %s (%d reconstruction(s) total)",
-        models[0], len(reconstructions),
+        "COLMAP sparse model: %s (%d reconstruction(s) total, kept largest)",
+        best, len(reconstructions),
     )
-    _align_to_gravity(models[0])
-    return models[0]
+    _align_to_gravity(best)
+    return best
 
 
 def colmap_available() -> bool:

@@ -219,6 +219,86 @@ def test_openapi_advertises_all_endpoints(client: TestClient) -> None:
         "/scenes",
         "/scenes/{scan_id}.ply",
         "/scenes/{scan_id}/thumb.jpg",
+        "/api/runs/{run_id}/process",
         "/healthz",
     }
     assert expected.issubset(set(paths.keys())), set(paths.keys()) - expected
+
+
+# ── Robohack run-processing webhook ───────────────────────────────────────────
+
+
+def test_process_run_returns_202_scan_id_and_queue_depth(client: TestClient) -> None:
+    r = client.post(
+        "/api/runs/run_abc/process",
+        json={"robohack_base": "http://localhost:9999", "ingest_token": "dummy"},
+    )
+    assert r.status_code == 202
+    body = r.json()
+    assert body["scan_id"].startswith("scn_")
+    assert isinstance(body["queue_depth"], int)
+    assert body["queue_depth"] >= 1
+
+
+def test_process_run_auto_creates_property_keyed_by_run(client: TestClient) -> None:
+    run_id = "run_xyz123"
+    sid = client.post(
+        f"/api/runs/{run_id}/process",
+        json={"robohack_base": "http://localhost:9999", "ingest_token": "t"},
+    ).json()["scan_id"]
+    pid = f"prop_run_{run_id[:12]}"
+    r = client.get(f"/properties/{pid}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == f"run:{run_id}"
+    scan_ids = [s["scan_id"] for s in body["scans"]]
+    assert sid in scan_ids
+
+
+def test_process_run_400_when_no_creds_in_body_or_env(
+    client: TestClient, monkeypatch
+) -> None:
+    """Empty body + no env vars → 400 with a useful message."""
+    monkeypatch.delenv("GS_POT_ROBOHACK_BASE", raising=False)
+    monkeypatch.delenv("GS_POT_INGEST_TOKEN", raising=False)
+    r = client.post("/api/runs/r/process", json={})
+    assert r.status_code == 400
+    assert "robohack_base" in r.json()["detail"]
+
+
+def test_process_run_falls_back_to_env(client: TestClient, monkeypatch) -> None:
+    """Body-less POST succeeds when env vars supply credentials."""
+    monkeypatch.setenv("GS_POT_ROBOHACK_BASE", "http://localhost:9999")
+    monkeypatch.setenv("GS_POT_INGEST_TOKEN", "env-token")
+    r = client.post("/api/runs/run_env/process", json={})
+    assert r.status_code == 202
+    assert r.json()["scan_id"].startswith("scn_")
+
+
+def test_process_run_accepts_trainer_and_quality_overrides(client: TestClient) -> None:
+    r = client.post(
+        "/api/runs/r/process",
+        json={
+            "robohack_base": "http://localhost:9999",
+            "ingest_token": "t",
+            "trainer": "opensplat",
+            "steps": 2500,
+            "quality": "medium",
+            "scene_name": "kitchen-run",
+        },
+    )
+    assert r.status_code == 202
+
+
+def test_cors_preflight_open(client: TestClient) -> None:
+    """Front-end at robohack's domain must be able to POST cross-origin."""
+    r = client.options(
+        "/api/runs/r/process",
+        headers={
+            "Origin": "https://robohack.example",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert r.status_code == 200
+    assert r.headers.get("access-control-allow-origin") == "*"

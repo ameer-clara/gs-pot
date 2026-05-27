@@ -47,8 +47,14 @@ def run_scan(
     steps: int = 7000,
     quality: Quality = "medium",
     trainer: TrainerName = "brush",
+    ingest_url: str | None = None,
+    ingest_token: str | None = None,
 ) -> ScanInfo:
     """Run the full pipeline. Mutates the scan in the store as we progress.
+
+    `ingest_url`/`ingest_token` override `GS_POT_INGEST_URL`/`GS_POT_INGEST_TOKEN`
+    env so per-request webhook calls (e.g. /api/runs/.../process) can target
+    robohack with a request-scoped token instead of a shared env secret.
 
     Raises on failure (and writes status=error to the store before re-raising).
     """
@@ -62,18 +68,18 @@ def run_scan(
         log.info("[%s] %s start: steps=%d", scan_id, trainer, steps)
         ply = run_trainer(trainer, workspace, workspace, steps=steps, export_name="scene.ply")
 
-        # Optional: push to robohack's ingest endpoint if both env vars are set.
-        ingest_url = os.environ.get("GS_POT_INGEST_URL")
-        ingest_token = os.environ.get("GS_POT_INGEST_TOKEN")
-        if ingest_url and ingest_token:
+        # Optional push to robohack. Explicit args take precedence over env vars.
+        push_url = ingest_url or os.environ.get("GS_POT_INGEST_URL")
+        push_token = ingest_token or os.environ.get("GS_POT_INGEST_TOKEN")
+        if push_url and push_token:
             _patch(scan_id, status=ScanStatus.PUSHING, progress=0.85)
             info = get_store().get(scan_id)
             label = _push_label(info) if info else None
-            log.info("[%s] pushing to %s (label=%s)", scan_id, ingest_url, label)
+            log.info("[%s] pushing to %s (label=%s)", scan_id, push_url, label)
             result = push_splat(
                 ply,
-                ingest_url=ingest_url,
-                token=ingest_token,
+                ingest_url=push_url,
+                token=push_token,
                 name=label,
             )
             _patch(

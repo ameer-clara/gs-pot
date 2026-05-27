@@ -93,3 +93,32 @@ class PropertyDetail(BaseModel):
     address: str | None
     created_at: datetime
     scans: list[ScanInfo]
+
+
+# ── Robohack run-processing webhook (called by the front-end on "end run") ────
+
+
+class ProcessRunRequest(BaseModel):
+    """Front-end calls this when the user ends a capture session.
+
+    gs-pot fetches the run's frames from robohack, trains a splat, and POSTs
+    the finished `.ply` back to robohack's `/api/robot/splat`.
+
+    `robohack_base` and `ingest_token` are optional in the body — if not
+    provided, gs-pot falls back to `GS_POT_ROBOHACK_BASE` and
+    `GS_POT_INGEST_TOKEN` env vars set on the Mac running gs-pot. That way
+    the browser doesn't have to hold the ingest secret. If both env and body
+    are unset, the endpoint returns 400.
+    """
+
+    robohack_base: str | None = Field(default=None, description="overrides GS_POT_ROBOHACK_BASE")
+    ingest_token: str | None = Field(default=None, description="overrides GS_POT_INGEST_TOKEN")
+    scene_name: str | None = Field(default=None, max_length=128)
+    trainer: Trainer = Trainer.BRUSH
+    steps: int = Field(default=2000, ge=500, le=60000)
+    quality: str = Field(default="low", pattern=r"^(low|medium|high|extreme)$")
+
+
+class ProcessRunResponse(BaseModel):
+    scan_id: str
+    queue_depth: int  # 0 = starts now; N = N other jobs are queued/running ahead
