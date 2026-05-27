@@ -18,6 +18,7 @@ sortable for debugging — COLMAP itself doesn't care about order.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -31,11 +32,16 @@ def fetch_run(
     dest_dir: Path,
     *,
     timeout: float = 60.0,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> int:
     """Download every frame for `run_id` from robohack into `dest_dir`.
 
-    Returns the number of images now present in `dest_dir` for this run
-    (counts both freshly downloaded and already-present files).
+    `on_progress(i, n)` is invoked once per frame *after* completion (counts
+    both freshly downloaded and already-present files, so resuming a partial
+    fetch still ticks the counter forward). Use it to surface "5/20"-style
+    progress in a UI status feed.
+
+    Returns the number of images now present in `dest_dir` for this run.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     list_url = f"{robohack_base.rstrip('/')}/api/scans/{run_id}"
@@ -61,19 +67,23 @@ def fetch_run(
 
     if not targets:
         log.warning("run %s: 0 frames found", run_id)
+        if on_progress:
+            on_progress(0, 0)
         return 0
 
-    log.info("run %s: %d frames to fetch", run_id, len(targets))
+    total = len(targets)
+    log.info("run %s: %d frames to fetch", run_id, total)
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        for fname, url in targets:
+        for i, (fname, url) in enumerate(targets, start=1):
             dst = dest_dir / fname
-            if dst.exists() and dst.stat().st_size > 0:
-                continue
-            with client.stream("GET", url) as resp:
-                resp.raise_for_status()
-                with dst.open("wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=65536):
-                        f.write(chunk)
+            if not (dst.exists() and dst.stat().st_size > 0):
+                with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    with dst.open("wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=65536):
+                            f.write(chunk)
+            if on_progress:
+                on_progress(i, total)
 
-    log.info("run %s: %d frames in %s", run_id, len(targets), dest_dir)
-    return len(targets)
+    log.info("run %s: %d frames in %s", run_id, total, dest_dir)
+    return total

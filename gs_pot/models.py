@@ -75,6 +75,10 @@ class ScanInfo(BaseModel):
     source: ScanSource
     status: ScanStatus
     progress: float = 0.0
+    # Sub-status string for the current stage — e.g. "downloading 5/20",
+    # "uploading 6.1 MB", "uploading 6.1 MB (retry 2/4)". Front-end shows
+    # this next to the coarse status for fine-grained progress.
+    detail: str | None = None
     scene_url: str | None = None
     thumb_url: str | None = None
     error: str | None = None

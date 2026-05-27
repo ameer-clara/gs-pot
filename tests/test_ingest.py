@@ -115,3 +115,82 @@ def test_push_splat_404_when_file_missing(tmp_path: Path) -> None:
 def test_accepted_formats_matches_robohack() -> None:
     """robohack's SPLAT_EXTS in app/apps/server/src/http/robot.ts:8."""
     assert ACCEPTED_FORMATS == {"ply", "spz", "splat", "ksplat", "sog"}
+
+
+# ── Retry / backoff behaviour ─────────────────────────────────────────────────
+
+
+def test_push_splat_retries_on_502_then_succeeds(fake_ply: Path, monkeypatch) -> None:
+    """Transient 502 → 502 → 200 should succeed; logs warn on retry."""
+    monkeypatch.setattr("gs_pot.ingest.time.sleep", lambda _: None)
+    call_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < 3:
+            return httpx.Response(502, text="bad gateway")
+        return httpx.Response(200, json={"id": "splat_ok", "key": "splats/ok.ply"})
+
+    with _mock_client(handler) as client:
+        result = push_splat(
+            fake_ply, ingest_url="https://x", token="t",
+            client=client, max_retries=3, base_backoff=0,
+        )
+    assert result == {"id": "splat_ok", "key": "splats/ok.ply"}
+    assert call_count["n"] == 3  # 2 failed + 1 success
+
+
+def test_push_splat_gives_up_after_max_retries_on_persistent_502(
+    fake_ply: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("gs_pot.ingest.time.sleep", lambda _: None)
+    call_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(502, text="bad gateway")
+
+    with _mock_client(handler) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            push_splat(
+                fake_ply, ingest_url="https://x", token="t",
+                client=client, max_retries=2, base_backoff=0,
+            )
+    assert call_count["n"] == 3  # 1 initial + 2 retries
+
+
+def test_push_splat_does_not_retry_on_401(fake_ply: Path, monkeypatch) -> None:
+    """Auth refusal is deliberate — retry would just burn cycles."""
+    monkeypatch.setattr("gs_pot.ingest.time.sleep", lambda _: None)
+    call_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(401, text="unauthorized")
+
+    with _mock_client(handler) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            push_splat(
+                fake_ply, ingest_url="https://x", token="bad",
+                client=client, max_retries=3, base_backoff=0,
+            )
+    assert call_count["n"] == 1
+
+
+def test_push_splat_retries_on_connect_error(fake_ply: Path, monkeypatch) -> None:
+    monkeypatch.setattr("gs_pot.ingest.time.sleep", lambda _: None)
+    call_count = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(200, json={"id": "ok", "key": "splats/ok.ply"})
+
+    with _mock_client(handler) as client:
+        result = push_splat(
+            fake_ply, ingest_url="https://x", token="t",
+            client=client, max_retries=3, base_backoff=0,
+        )
+    assert result == {"id": "ok", "key": "splats/ok.ply"}
+    assert call_count["n"] == 2

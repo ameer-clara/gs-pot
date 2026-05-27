@@ -39,6 +39,10 @@ def _push_label(info: ScanInfo) -> str:
     return info.scene_name
 
 
+def _set_detail(scan_id: str, text: str | None) -> None:
+    _patch(scan_id, detail=text)
+
+
 def run_scan(
     *,
     scan_id: str,
@@ -72,7 +76,7 @@ def run_scan(
         push_url = ingest_url or os.environ.get("GS_POT_INGEST_URL")
         push_token = ingest_token or os.environ.get("GS_POT_INGEST_TOKEN")
         if push_url and push_token:
-            _patch(scan_id, status=ScanStatus.PUSHING, progress=0.85)
+            _patch(scan_id, status=ScanStatus.PUSHING, progress=0.85, detail=None)
             info = get_store().get(scan_id)
             label = _push_label(info) if info else None
             log.info("[%s] pushing to %s (label=%s)", scan_id, push_url, label)
@@ -81,6 +85,7 @@ def run_scan(
                 ingest_url=push_url,
                 token=push_token,
                 name=label,
+                on_progress=lambda text: _set_detail(scan_id, text),
             )
             _patch(
                 scan_id,

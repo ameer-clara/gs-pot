@@ -8,6 +8,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# Configure gs_pot.* logging at module import. Uvicorn sets up its own
+# uvicorn.* handlers but leaves the root logger alone, so without this our
+# `log = logging.getLogger(__name__)` lines silently drop on the floor when
+# the server runs in background-worker threads. Pin the level via
+# GS_POT_LOG_LEVEL (default INFO).
+logging.basicConfig(
+    level=os.environ.get("GS_POT_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s  %(message)s",
+)
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -224,17 +234,23 @@ def _process_run_job(
 ) -> None:
     """Pull a robohack run's frames, train a splat, push the .ply back."""
     images_src = SCENES_DIR / scan_id / "images_src"
-    try:
+
+    def _patch_status(**changes: Any) -> None:
         info = get_store().get(scan_id)
         if info is not None:
-            get_store().put(
-                info.model_copy(update={"status": ScanStatus.CAPTURING, "progress": 0.05})
-            )
+            get_store().put(info.model_copy(update=changes))
 
-        n = fetch_run(robohack_base, run_id, images_src)
+    def _on_download(i: int, n: int) -> None:
+        _patch_status(detail=f"downloading frame {i}/{n}")
+
+    try:
+        _patch_status(status=ScanStatus.CAPTURING, progress=0.05, detail="downloading")
+
+        n = fetch_run(robohack_base, run_id, images_src, on_progress=_on_download)
         log.info("[%s] downloaded %d frames from run %s", scan_id, n, run_id)
         if n == 0:
             raise RuntimeError(f"no frames found for run {run_id}")
+        _patch_status(detail=None)  # clear download detail before pipeline takes over
 
         run_scan(
             scan_id=scan_id,
