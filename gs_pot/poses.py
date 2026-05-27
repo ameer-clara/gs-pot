@@ -60,12 +60,15 @@ _QUALITY_PRESETS: dict[Quality, dict[str, Any]] = {
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 
-# Minimum SfM output we'll accept before handing off to Brush. Below these
-# thresholds the reconstruction is too degenerate to train on, and Brush
-# panics deep in Rust with `min > max, NaN` (clamp on zero scene scale).
-# Fail loudly with a useful message here instead.
-_MIN_REG_IMAGES = 10
-_MIN_3D_POINTS = 50
+# Minimum SfM output Brush will actually accept. The Brush panic
+# (`min > max, NaN` in a clamp) is specifically triggered by a zero-extent
+# scene — 1 point at one position → `max_scale = 0`. Three-camera /
+# ~100-point sparse reconstructions train fine (verified in the wild:
+# scn_abe593bb8fb9 ran 2k steps to a 0.1 MB ply). So the thresholds err
+# very low — we only want to reject the truly unreconstructable cases,
+# not narrow-baseline-but-valid ones.
+_MIN_REG_IMAGES = 2
+_MIN_3D_POINTS = 10
 _MIN_SCENE_DIAGONAL = 0.01
 
 
