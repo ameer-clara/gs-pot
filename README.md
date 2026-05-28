@@ -1,58 +1,100 @@
-# gs-pot
+# murobo
 
-**Robot-scanned Gaussian Splats → VR walkthroughs in the browser.**
+> **On-demand robots, powered by the network of minds.**
+> Rent a robot. An agent decides what jobs to run. Two of those jobs:
+> 1. **Splat** — robot walks a room, you get a 3D Gaussian Splat in VR.
+> 2. **Sense** — WiFi-CSI motion bridge, robot barks when someone enters.
 
-A Unitree Go2 (or just a phone) captures images of a room, the pipeline trains
-a 3D Gaussian Splat, and a buyer/renter views it in any browser — with WebXR
-for Quest 3 / Vision Pro / Cardboard.
-
-Built for the [DIMENSIONAL Hackathon Shanghai][robohack] (May 26–28, 2026) as
-a submodule at `packages/gs-pot`.
+Built for the [DIMENSIONAL Hackathon Shanghai][robohack] (May 26–28, 2026).
+murobo is the **producer**: agents POST to its HTTP API to dispatch a
+robot job, and consume the result (a `.ply`, a webhook, a bark). The agent
+side is the [robohack][robohack] repo.
 
 [robohack]: https://github.com/grmkris/robohack
 
-## Why
-The China real-estate VR-tour market is real and proven — Beike/Lianjia ships
-~1M VR-shot apartments. The bottleneck is the human shooter with the rig. A
-quadruped is the natural shooter: walks itself, runs every day, no schedule.
-See [CLAUDE.md](./CLAUDE.md) for the full strategy.
+---
 
-## Module shape
+## The 60-second demo
 
-`gs-pot` is the **producer** side. Input: images. Output: a `.ply` Gaussian
-splat plus a thumbnail, served over HTTP. A separate front-end (built by a
-teammate) consumes the `.ply` URL via [Spark][] or any compatible viewer.
+**Splat → VR walkthrough**
+1. Agent dispatches a `room_scan` job; the Unitree Go2 walks the room and uploads frames.
+2. Agent calls `POST /api/runs/<run>/process` on murobo.
+3. ~10–30 min later the run's status flips to `ready` and a `.ply` URL drops.
+4. Open it on a Quest 3 / Vision Pro — tap **Enter VR**. Walk the room.
 
+**Sense → motion alert**
+1. Agent calls `POST /api/motion/calibrate`, then `POST /api/motion/start`.
+2. Two ESP32-S3 nodes on the robot stream WiFi CSI through walls.
+3. murobo runs an adaptive threshold; on quiet→motion the Go2 **barks** + a webhook fires.
+
+## Why this exists
+
+The pitch is **robots-as-a-service brokered by AI agents**: an operator owns
+the fleet, a renter describes a job in natural language, and an agent picks
+the right robot + the right pipeline to run on it. Two ready-made jobs:
+
+**Splat side.** China's VR home-tour market is real — Beike/Lianjia ships ~1M
+VR-shot apartments and credits VR for ~20% of lead conversion. The bottleneck
+is **the human shooter with the tripod rig**. A quadruped is the natural
+shooter: walks itself, runs every day, no human schedule. An agent that can
+rent the shooter on demand closes the loop.
+
+**Sense side.** The same rented robot doubles as an inspection / security
+dog. WiFi-CSI sees through walls and doesn't need cameras pointed at the
+renter — privacy-positive presence detection. Same hardware, second
+recurring-revenue surface, same agent dispatching it.
+
+[spark]: https://github.com/sparkjsdev/spark
+
+---
+
+## Pipelines
+
+**Splat**
 ```
-images  ──▶  COLMAP poses  ──▶  Brush train  ──▶  .ply + thumb.jpg
-                                                      │
-                                                      ▼
-                                    HTTP: /scenes/<scan_id>.ply
-                                          ▲
-                            (teammate's front-end loads here)
+images → COLMAP poses → Brush train → gravity-align → .ply + thumb.jpg
+                                                              │
+                              ┌───────────────────────────────┤
+                              ▼                               ▼
+              local: /scenes/<scan_id>.ply       push to robohack
+                                                 POST /api/robot/splat
+                                                              │
+                                                              ▼
+                                            robohack.apps/web ← Spark + WebXR
 ```
 
-Domain model:
+**Sense**
+```
+ESP32-S3 CSI ──UDP──▶ sensing-server :3000 ──HTTP──▶ murobo detector
+                                                          │ μ + k·σ adaptive
+                                                          │ hysteresis
+                                                          ▼
+                                                  ┌───────┴────────┐
+                                                  ▼                ▼
+                                            POST webhook     Go2 barks
+                                                             (`say` in dev)
+```
 
-- **Property** (apartment / listing) groups N **Scans** (rooms).
+Domain model (splat side):
+
+- **Property** (apartment) groups N **Scans** (rooms).
 - One Scan → one `.ply` at `/scenes/<scan_id>.ply`.
-- Filesystem is flat (`scenes/<scan_id>/`); Property is the logical grouping.
 
-[Spark]: https://github.com/sparkjsdev/spark
+---
 
 ## Install
 
-Requirements: macOS or Linux, Python 3.12, [uv][uv].
+macOS or Linux, Python 3.12, [uv][uv].
 
 ```bash
-# 1. Python deps (creates .venv)
+# Python deps
 uv sync --extra dev
 
-# 2. COLMAP (sparse SfM for camera poses)
-brew install colmap                 # Mac
+# COLMAP (sparse SfM)
+brew install colmap                 # mac
 # Linux:  sudo apt install colmap
 
-# 3. Brush 0.3.0 release binary (the trainer)
+# Brush 0.3.0 trainer binary
 cd bin/
 curl -sL -o brush.tar.xz https://github.com/ArthurBrussee/brush/releases/download/v0.3.0/brush-app-aarch64-apple-darwin.tar.xz
 tar -xJf brush.tar.xz && rm brush.tar.xz
@@ -60,1003 +102,362 @@ ln -sf brush-app-aarch64-apple-darwin/brush_app brush
 ./brush --version                   # → brush-cli 0.3.0
 cd ..
 
-# 4. Verify
 uv run pytest                       # → 18 passed
 ```
 
-For Linux x86_64 / Windows, swap the Brush release filename — see
-[Brush releases][brush-rel]. Override the binary path with
-`BRUSH_BIN=/path/to/brush` if you install elsewhere.
+Linux x86_64 / Windows: swap the Brush release filename (see
+[Brush releases][brush-rel]). Override with `BRUSH_BIN=/path/to/brush`.
 
 [uv]: https://docs.astral.sh/uv/
 [brush-rel]: https://github.com/ArthurBrussee/brush/releases
 
-## Quick start: generate a splat from phone photos
+---
 
-### 1. Capture (50–150 photos of one room)
+## Quickstart — robot frames to splat (local)
 
-- Slow walk in a circle; one photo every 1–2 steps (50–70% overlap).
-- Two height passes (waist + head) if you can — boosts coverage.
-- Landscape orientation, consistent across all shots.
-- No moving people / pets. Good even lighting.
-- Drop them in `./photos/living_room/` (or anywhere).
-
-### 2. Run the pipeline
+For end-to-end with the agent, see [The production loop](#the-production-loop--agent-webhook)
+below. The CLI below is the fast inner loop: point it at a directory of
+robot-captured frames and out comes a `.ply`.
 
 ```bash
-# Default (Brush trainer, medium COLMAP):
-uv run python -m gs_pot scan \
-    --images ./photos/living_room \
-    --property-name "My Apt" \
-    --scene-name "living_room"
+# A directory of JPEGs the Go2 (or any capture client) dropped in scenes/<run>/images/
+./scripts/scan-room.sh living_room "Apt 3F"
+# → scenes/<scan_id>/scene.ply + viewer URL
 
-# Same thing via the wrapper script (also converts HEIC):
-./scripts/scan-room.sh living_room "My Apt"
-
-# Faster trainer (once OpenSplat is built — see bin/README.md):
-./scripts/scan-room.sh living_room "My Apt" --trainer opensplat --steps 2000
+# Serve + view:
+./scripts/dev.sh                    # FastAPI + /web on :8000
+# open  http://localhost:8000/web/?scene=/scenes/<scan_id>.ply
 ```
 
-Knobs:
-
-| Flag | Default | Notes |
+| Knob | Default | Notes |
 |---|---|---|
-| `--trainer {brush,opensplat}` | `brush` | See [Trainer choice](#trainer-choice-brush-vs-opensplat) below. |
-| `--quality {low,medium,high,extreme}` | `medium` | COLMAP preset. See [Quality presets](#quality-presets). |
-| `--steps N` | trainer default | Brush: `7000`. OpenSplat: `2000`. |
-| `--scenes-dir PATH` | `./scenes` | Where the workspace + outputs land. |
+| `--trainer {brush,opensplat}` | `brush` | OpenSplat is 3–5× faster once built ([bin/README](./bin/README.md)) |
+| `--quality {low,medium,high,extreme}` | `medium` | COLMAP SfM preset |
+| `--steps N` | Brush 7000, OpenSplat 2000 | trainer-aware |
 
-Output:
+For best results the robot's `room_scan` skill stops at multiple positions and
+sweeps ~12–24 headings per stop (50–70% overlap between adjacent frames).
+30–120 frames per room is the working range.
 
-- `scenes/<scan_id>/scene.ply` — the Gaussian splat
-- `scenes/<scan_id>/thumb.jpg` — thumbnail
-- The CLI prints a viewer URL **and a summary table** with registered-image
-  count, 3D-point count, splat count, .ply size, and wall time.
+Wall time on M4 Max (30–120 frames, `--quality medium`):
+- Brush 7k steps: ~10–30 min
+- OpenSplat 2k steps: ~3–8 min
 
-Expected wall time on an M4 Max with ~30–100 photos, `--quality medium`:
-- Brush, 7k steps: ~10–30 min
-- OpenSplat, 2k steps: ~3–8 min  (3–5× faster)
+---
 
-COLMAP poses are fast (<10 s for 30 photos at `low`); training dominates total time.
+## The production loop — agent webhook
 
-## Trainer choice (Brush vs OpenSplat)
+In production murobo runs on the operator's Mac behind ngrok. An agent
+(robohack `apps/server` / `apps/web`) fires the webhook; murobo fetches the
+captured frames from object storage, trains, pushes the splat back, and the
+agent's "View splat" link goes live.
 
-Both trainers consume the same COLMAP workspace (`images/` + `sparse/0/*.bin`)
-and emit a standard `.ply` Spark can read. They're swappable per-scan via
-`--trainer`.
-
-| Concern | Brush 0.3.0 | OpenSplat |
-|---|---|---|
-| Backend | Rust / WGPU → Metal | C++ / libtorch native Metal |
-| Install | release binary in `bin/brush` (works out of the box) | `brew install cmake opencv pytorch` + cmake build, ~10–20 min one-time (see `bin/README.md`) |
-| Cross-platform | macOS / Linux / Windows | macOS (MPS) + Linux/Windows (CUDA, ROCm) |
-| Speed on M4 Max | 15k steps ≈ 29 min (measured on 9 photos) | 2k steps ≈ ~5 min (3–5× faster reported) |
-| Step semantics | gradient steps; converges at 5k–15k | "n iterations"; converges at 2k–5k |
-| Default `--steps` | 7000 | 2000 |
-| License | Apache-2.0 + MIT | AGPLv3 (commercial use OK) |
-
-**When to use which:**
-- **Brush** is the default — always works, no build step. Use it on a fresh
-  laptop, in CI, or for sanity-check scans.
-- **OpenSplat** is the speed path. Use it once you're iterating (more photos,
-  more reruns, more demos). It's also what we'd ship to the venue laptop on
-  hackathon day 1 — same Metal backend on Mac, native CUDA on the Linux box.
-
-Override the binary location with `BRUSH_BIN=` / `OPENSPLAT_BIN=` env vars
-if you put them somewhere other than `bin/`.
-
-## Quality presets
-
-The `--quality` flag drives COLMAP's SfM, not the splat trainer. It controls
-how aggressive feature extraction + bundle adjustment are. Tuned for the
-real-estate scan use case (room-scale, mixed lighting):
-
-| Preset | Image size | Max SIFT features | Guided matching | BA iters (local / global) | When |
-|---|---|---|---|---|---|
-| `low`     | 1000 px | 2048  | off | 12 / 30  | first-pass smoke test; **safe on low-texture scenes (bathrooms, white walls)** |
-| `medium`  | 1600 px | 8192  | off | 16 / 50  | default; what most rooms want |
-| `high`    | 2400 px | 16384 | on  | 25 / 75  | textured rooms with many photos; slower SfM |
-| `extreme` | 3200 px | 32768 | on  | 40 / 100 | maximum quality, OPENCV (5-param) camera model |
-
-**Important counter-intuitive note:** for weak-texture scenes (bathrooms,
-white walls, tile, mirrors), `low` often **registers more images than
-`medium`+`high`**. The higher presets enable `guided_matching`, which prunes
-matches that don't fit the initial epipolar geometry — but the initial
-geometry on weak features is noisy, so guided matching over-prunes and the
-mapper can fail to find an initial image pair. Start with `low` on tricky
-scenes, then promote if everything registers cleanly.
-
-### 3. View it
-
-In another terminal:
+### Setup (one-time)
 
 ```bash
-./scripts/dev.sh                    # serves /web/ + the API on :8000
-```
-
-Open the URL the CLI printed:
-
-```
-http://localhost:8000/web/?scene=/scenes/<scan_id>.ply
-```
-
-- Desktop: Chrome 134+ on Mac (Spark uses modern WebGL2). Drag to look, WASD to move.
-- VR: open the same URL on Quest 3 / Vision Pro browser, click "Enter VR" (top-right).
-- Phone: open in iOS Safari or Android Chrome — viewer works, just no head tracking.
-
-## How the pipeline works
-
-`scan-room.sh` orchestrates the full producer side:
-
-```
-./scripts/scan-room.sh <room> "<property-name>" [--trainer brush|opensplat] [--steps N] [--quality low|medium|high|extreme]
-    │
-    ├─ HEIC → JPG conversion (sips, ffmpeg fallback)  ── skipped if no .HEIC
-    ├─ count images, fail loudly if 0
-    └─ exec  uv run python -m gs_pot scan ...
-                │
-                ▼  Python pipeline (gs_pot/pipeline.py)
-        ┌───────────────────────────────────────────────────────┐
-        │ A. POSES   — gs_pot/poses.py                          │
-        │    • symlink every real image (.jpg/.png) into        │
-        │      scenes/<id>/images/ (filters out .DS_Store etc.) │
-        │    • pycolmap.extract_features                        │
-        │    • pycolmap.match_exhaustive                        │
-        │    • pycolmap.incremental_mapping                     │
-        │    → scenes/<id>/sparse/0/{cameras,images,points3D}.bin│
-        ├───────────────────────────────────────────────────────┤
-        │ B. TRAINING — gs_pot/train.py (dispatched by trainer) │
-        │    --trainer brush     →  bin/brush <ws>  --total-steps N            │
-        │    --trainer opensplat →  bin/opensplat <ws>  -n N  -o scene.ply     │
-        │    → scenes/<id>/scene.ply                            │
-        ├───────────────────────────────────────────────────────┤
-        │ C. PUSH    — gs_pot/ingest.py (optional)              │
-        │    if GS_POT_INGEST_URL + TOKEN set:                  │
-        │      POST .ply to robohack /api/robot/splat (Bearer)  │
-        │      → records ingest_id, ingest_key on the scan      │
-        ├───────────────────────────────────────────────────────┤
-        │ D. THUMB   — gs_pot/thumb.py                          │
-        │    first image → scenes/<id>/thumb.jpg                │
-        ├───────────────────────────────────────────────────────┤
-        │ E. READY   — store status flipped to "ready",         │
-        │              scene_url=/scenes/<id>.ply               │
-        └───────────────────────────────────────────────────────┘
-```
-
-Status flow (read by `GET /scans/<id>`):
-
-```
-queued ──▶ poses ──▶ training ──▶ pushing* ──▶ ready
-                │                              ↑
-                └─────────── error ◀───────────┘   (* skipped if no ingest config)
-```
-
-Output sitting on disk for each scan:
-
-```
-scenes/<scan_id>/
-  database.db    ← COLMAP SfM database (intermediate)
-  images/        ← per-file symlinks of the inputs (filtered, no .DS_Store etc.)
-  sparse/0/      ← cameras.bin, images.bin, points3D.bin
-  scene.ply      ← the Gaussian splat — this is what Spark loads
-  thumb.jpg      ← first frame, served at /scenes/<id>/thumb.jpg
-```
-
-The `scene.ply` is the boundary file between producer (us) and consumer (the
-teammate's front-end / Spark). When `GS_POT_INGEST_URL` is set, the same
-`.ply` is also POSTed to robohack's ingest endpoint — see
-[Pushing splats to robohack](#pushing-splats-to-robohack-production-integration)
-below.
-
-### Why pycolmap, not the colmap CLI
-
-We use [pycolmap](https://github.com/colmap/pycolmap) (pip-installable COLMAP
-Python bindings) instead of invoking the `colmap` CLI as a subprocess.
-Reason: Homebrew's macOS arm64 build of COLMAP has a deterministic
-use-after-free in `Creating SIFT CPU feature matcher` that crashes the
-matcher with SIGSEGV. pycolmap's wheels ship their own COLMAP binary built
-via cibuildwheel for darwin-arm64 and don't hit the bug. The Python API is
-also cleaner — no flag-name-by-version churn.
-
-## End-to-end walkthrough (in detail)
-
-This is the full production loop — from a robot capturing frames to a buyer
-viewing the trained splat in VR. Every API call, every env var, every log
-line you'd see. The Mermaid diagrams in [FLOWS.md](./FLOWS.md) are the
-visual counterpart.
-
-### Cast of characters
-
-| Service | Where | Role |
-|---|---|---|
-| **robohack `apps/server`** | Railway, behind Caddy gateway | Frames + splats source of truth (Hono on Bun, Postgres for metadata, S3 for blobs) |
-| **robohack `apps/gateway`** | Railway | Single public host `https://gateway-production-…railway.app`. Caddy routes `/api/robot/*`, `/api/scans*`, `/api/auth/*`, `/rpc/*`, `/api/upload/*` to apps/server; everything else to apps/web. |
-| **robohack `apps/web`** | Railway, behind same gateway | Next.js front-end. "Build splat" button on `/scans` |
-| **Go2 + DimOS** | On the venue LAN | Captures images; POSTs each to apps/server `/api/robot/frame` with `run`/`position`/`angle` |
-| **gs-pot** *(this repo)* | Your Mac, via ngrok | The reconstruction box. Receives the webhook, downloads frames, runs COLMAP + Brush + gravity-align, pushes the `.ply` back |
-| **ngrok** | Your Mac | Public HTTPS tunnel from `https://twilight-getting-possum.ngrok-free.dev` → `localhost:8000` |
-
-### Setup checklist (one-time per dev box)
-
-**On your Mac (running gs-pot):**
-
-```bash
-# 1. Python deps + Brush binary — see Install section above.
-
-# 2. .env (gitignored). dev.sh auto-sources it.
 cat > .env <<EOF
 GS_POT_INGEST_TOKEN=<ROBOT_INGEST_TOKEN from robohack/apps/server>
 GS_POT_ROBOHACK_BASE=https://gateway-production-94e2.up.railway.app
 EOF
 
-# 3. Start the server.
-./scripts/dev.sh                       # FastAPI on 127.0.0.1:8000
-
-# 4. Expose via ngrok in a separate terminal.
+./scripts/dev.sh                                              # localhost:8000
 ngrok http --url=https://twilight-getting-possum.ngrok-free.dev 8000
 ```
 
-**On Railway (web service env):**
-
+On Railway's web service:
 ```
 NEXT_PUBLIC_GS_POT_URL=https://twilight-getting-possum.ngrok-free.dev
 ```
+Redeploy so Next.js inlines the var; without it the "Build splat" button is silently hidden.
 
-Then trigger a redeploy of the web service so Next.js inlines the var at
-build time. Without it the "Build splat" button is silently hidden.
+### The flow
 
-### The flow, step by step
-
-**1. User opens `/scans` in robohack.**
-
-`apps/web` mounts the `ScansBrowser` component which polls oRPC
-`frames.scans` every 5s. Page renders each run with its position thumbnails.
-If `NEXT_PUBLIC_GS_POT_URL` was baked in at build time, a "Build splat"
-button appears on each run header.
-
-**2. Robot captures frames (concurrent with the page being open).**
-
-For every image the Go2 (or any capture client) takes:
-
-```http
-POST https://gateway-production-94e2.up.railway.app/api/robot/frame
-Authorization: Bearer <ROBOT_INGEST_TOKEN>
-Content-Type: multipart/form-data
-
-  file:     <jpeg bytes>
-  run:      <session-uuid>
-  position: <stop index>     0, 1, 2, …
-  angle:    <heading deg>    0.0, 15.0, 30.0, …
-  poseX:    <robot x>        optional
-  poseY:    <robot y>        optional
-```
-
-apps/server validates the token, writes the JPEG to S3, inserts a row in
-the `frames` table with `run`/`position`/`angle`/`poseX`/`poseY`/`embedding`.
-Responds `200 { "key": "robot/frame_….jpg" }`. The web page picks the new
-frames up on its next 5s poll.
-
-**3. User clicks "Build splat" on a run.**
-
-The React component fires:
-
-```http
-POST https://twilight-getting-possum.ngrok-free.dev/api/runs/<run_id>/process
-Content-Type: application/json
-ngrok-skip-browser-warning: true
-
-{}
-```
-
-Empty body is fine — gs-pot reads `GS_POT_ROBOHACK_BASE` and
-`GS_POT_INGEST_TOKEN` from its `.env`. Browser cannot see those secrets.
-`ngrok-skip-browser-warning` bypasses ngrok-free's HTML interstitial that
-otherwise returns no CORS headers and confuses the React app.
-
-**4. gs-pot accepts the request.**
-
-`gs_pot/server.py`:
-- CORSMiddleware answers the OPTIONS preflight (CORS is open `*`).
-- `process_run(run_id, req)`:
-  - Reads `GS_POT_ROBOHACK_BASE` + `GS_POT_INGEST_TOKEN` from env (body was empty).
-  - Validates both are present — returns `400` with a clear message otherwise.
-  - Auto-creates a `Property` in the in-process store keyed off the run id
-    (`prop_run_<run_id[:12]>`, name `run:<run_id>`).
-  - Mints `scan_id = "scn_<12hex>"`, writes a `ScanInfo{status=queued}` row.
-  - Picks trainer-aware default `steps` (Brush:7000, OpenSplat:2000) if the
-    body didn't override.
-  - Submits the job to `_JobQueue` (single-worker FIFO).
-  - Responds `202 { "scan_id": "scn_…", "queue_depth": N }`.
-
-**5. Front-end starts polling.**
-
-The component flips to "queued" state and polls every 3 s:
-
-```http
-GET https://twilight-getting-possum.ngrok-free.dev/scans/<scan_id>
-ngrok-skip-browser-warning: true
-```
-
-gs-pot returns the live `ScanInfo`:
-
-```json
-{
-  "scan_id": "scn_…", "property_id": "prop_run_…", "scene_name": "run-…",
-  "status": "capturing",
-  "progress": 0.05,
-  "detail": "downloading 12/20",
-  "scene_url": null,
-  "thumb_url": null,
-  "ingest_id": null, "ingest_key": null,
-  "error": null,
-  "created_at": "2026-05-27T…"
-}
-```
-
-The button text follows `status` + `detail`:
-`queued… → capturing… 5% · downloading 12/20 → poses… 10% → training… 40% → pushing… 85% · uploading 6.1 MB`.
-
-**6. Worker thread picks up the job (single-worker FIFO).**
-
-`_process_run_job(scan_id, run_id, robohack_base, ingest_token, …)`:
-
-  a. Patches status to `capturing`, `progress=0.05`, `detail="downloading"`.
-
-  b. Calls `runs.fetch_run(robohack_base, run_id, scenes/<scan_id>/images_src/)`:
-     - `GET <gateway>/api/scans/<run_id>` → JSON tree of positions/images with presigned S3 URLs (6h TTL).
-     - For each image: `GET <presigned-url>` → stream to disk as `p<pos>_a<angle>_<id>.jpg`.
-     - Calls `on_progress(i, n)` after each → patches `detail="downloading 5/20"`.
-     - Skips files already on disk (resume after crash).
-
-  c. Patches `detail=None`, then calls `pipeline.run_scan(scan_id, images_src, …)`:
-
-     **c.1 Poses (`gs_pot/poses.py`)** — patches `status=poses`, `progress=0.1`:
-       - Per-file symlinks every real `.jpg/.png` into `scenes/<scan_id>/images/`,
-         skipping `.DS_Store` and hidden dirs.
-       - `pycolmap.extract_features` (CPU, SIMPLE_RADIAL camera, 2048 SIFT features at `low`).
-       - `pycolmap.match_exhaustive` (CPU).
-       - `pycolmap.incremental_mapping` → `sparse/0/{cameras,images,points3D}.bin`.
-       - `_align_to_gravity(sparse/0)` rotates so cameras' mean "down" maps to world −Y.
-       - We use **pycolmap, not the `colmap` CLI** — homebrew's macOS arm64
-         COLMAP has a deterministic SIFT-matcher SIGSEGV.
-
-     **c.2 Training (`gs_pot/train.py`)** — patches `status=training`, `progress=0.4`:
-       - Spawns `bin/brush <workspace> --total-steps N --export-name scene.ply`.
-       - Wall time on M4 Max: ~3 min for 5k steps, ~30 min for 15k steps
-         (the per-step cost grows as Brush densifies).
-       - Writes `scenes/<scan_id>/scene.ply`.
-
-     **c.3 Push back to robohack (`gs_pot/ingest.py`)** — patches
-     `status=pushing`, `progress=0.85`:
-       - Builds `name = "<property name> · <scene name>"`, e.g. `"run:scan-…" · "run-scan-1779879441"`.
-       - For each attempt (up to 4):
-         - Patches `detail="uploading 6.1 MB"` (or `"… (retry 2/4)"`).
-         - `POST <gateway>/api/robot/splat` multipart `{file, format, name}` with `Authorization: Bearer <token>`.
-         - **Retries** on 502/503/504, ConnectError, ReadTimeout, RemoteProtocolError with exponential backoff (2 s, 4 s, 8 s).
-         - **Does not retry** on 401/403/400/413/415 (deliberate refusals).
-         - On 200 `{ id: "splat_…", key: "splats/….ply" }`: patches `ingest_id` and `ingest_key` on the scan.
-
-     **c.4 Thumbnail (`gs_pot/thumb.py`)** — first image → `scenes/<scan_id>/thumb.jpg` (512px JPEG).
-
-     **c.5 Done** — patches `status=ready`, `progress=1.0`,
-     `scene_url=/scenes/<scan_id>.ply`, `thumb_url=/scenes/<scan_id>/thumb.jpg`.
-
-**7. Front-end sees `status=ready`.**
-
-The polling effect stops, button flips to a green
-`View splat ↗` link pointing at
-`https://twilight-getting-possum.ngrok-free.dev/web/?scene=/scenes/<scan_id>.ply`.
-
-**8. User clicks "View splat".**
-
-New tab loads gs-pot's static viewer (`web/index.html` + `web/viewer.js`).
-Spark + Three.js + WebXR load from CDN via importmap. The viewer reads
-`?scene=…` and calls `new SplatMesh({ url })` against gs-pot's
-`/scenes/<scan_id>.ply` route, which is a `FileResponse` of the binary.
-On Quest 3 / Vision Pro browser the "Enter VR" button appears top-right.
-
-**9. Meanwhile, the splat also lives in robohack.**
-
-Because step 6.c.3 pushed it, apps/server stored it in S3 (`splats/<id>.ply`)
-and inserted a row in the `splats` table. The oRPC `splats.list` procedure
-serves it to wherever the front-end lists splats — typically with a long
-presigned URL TTL so embedded viewers stay valid.
-
-### What you should see in `./scripts/dev.sh`
-
-Restart the server first so it picks up `logging.basicConfig` — without that
-the `gs_pot.*` loggers silently drop (uvicorn only configures its own
-`uvicorn.*` loggers).
+1. Renter asks the agent for a VR walkthrough; agent dispatches `room_scan` to the rented Go2.
+2. Robot POSTs each frame to `<gateway>/api/robot/frame` (run/position/angle).
+3. Agent calls `<ngrok>/api/runs/<run>/process {}` on murobo.
+4. murobo 202s, queues the job, mints `scan_id`, polls visible at `GET /scans/<scan_id>`.
+5. Worker: download frames → COLMAP → gravity-align → Brush → push `.ply`.
+6. Status `ready` lands; agent surfaces the **View splat ↗** link to the renter.
 
 ```
-2026-05-27 08:45:00 INFO  uvicorn.error           Uvicorn running on http://127.0.0.1:8000
-2026-05-27 08:45:01 INFO  uvicorn.access          204.188.233.66:0 - "OPTIONS /api/runs/scan-…/process HTTP/1.1" 200 OK
-2026-05-27 08:45:01 INFO  uvicorn.access          204.188.233.66:0 - "POST /api/runs/scan-…/process HTTP/1.1" 202 Accepted
-2026-05-27 08:45:01 INFO  gs_pot.runs             fetching run scan-… from https://gateway-…/api/scans/scan-…
-2026-05-27 08:45:02 INFO  gs_pot.runs             run scan-…: 120 frames to fetch
-2026-05-27 08:45:14 INFO  gs_pot.runs             run scan-…: 120 frames in scenes/scn_…/images_src
-2026-05-27 08:45:14 INFO  gs_pot.poses            staged 120 images at scenes/scn_…/images
-2026-05-27 08:45:14 INFO  gs_pot.poses            pycolmap: extract_features (max_image_size=1000, max_features=2048, camera=SIMPLE_RADIAL)
-2026-05-27 08:45:18 INFO  gs_pot.poses            pycolmap: match_exhaustive (guided=False)
-2026-05-27 08:45:22 INFO  gs_pot.poses            pycolmap: incremental_mapping
-2026-05-27 08:45:25 INFO  gs_pot.poses            COLMAP sparse model: scenes/scn_…/sparse/0 (1 reconstruction(s) total)
-2026-05-27 08:45:25 INFO  gs_pot.poses            gravity-align: rotated 120 cameras + N points (|mean down|=0.97)
-2026-05-27 08:45:25 INFO  gs_pot.train            running: bin/brush scenes/scn_… --total-steps 7000 …
-2026-05-27 08:50:30 INFO  gs_pot.train            Brush exported: scenes/scn_…/scene.ply
-2026-05-27 08:50:30 INFO  gs_pot.ingest           pushing scene.ply (6.1 MB) → https://gateway-…/api/robot/splat  [up to 4 attempts]
-2026-05-27 08:50:33 WARN  gs_pot.ingest           push got 502 on attempt 1/4, retrying in 2.0s
-2026-05-27 08:50:37 INFO  gs_pot.ingest           ingest accepted on attempt 2/4: id=splat_… key=splats/….ply
-2026-05-27 08:50:37 INFO  gs_pot.thumb            thumbnail: scenes/scn_…/thumb.jpg
-2026-05-27 08:50:37 INFO  gs_pot.pipeline         [scn_…] DONE
+queued → capturing (downloading 12/20) → poses (10%) → training (40%)
+       → pushing (uploading 6.1 MB, retry 2/4 if 502) → ready (1.0)
 ```
 
-### Failure modes + recovery (lessons learned)
+The push to `/api/robot/splat` is multipart `{file, format, name}` with Bearer
+auth. Retry-with-backoff (2s/4s/8s) on 502/503/504 + ConnectError/ReadTimeout
+because Railway's edge occasionally hiccups on large uploads.
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `502 Bad Gateway` mid-push | Railway edge proxy hiccup on large multipart upload | Retry-with-backoff in `push_splat` handles it; if it survives 4 attempts, manually re-push the on-disk `.ply` with curl |
-| `GET /api/scans/<run>` returns Next.js 404 HTML | Old Caddyfile didn't route `/api/scans*` to apps/server | Fixed on robohack master; redeploy gateway |
-| Brush panic `min > max, or either was NaN` | Webhook defaulted `steps=2000`; Brush's lr schedule needs ≥ ~5000 | Fixed: trainer-aware default (Brush:7000, OpenSplat:2000) |
-| `httpx.ConnectError: connection refused` in worker logs during tests | Tests post to a fake `localhost:9999`; queue worker logs the expected failure after the test's assertion | Cosmetic; ignore |
-| CORS error in browser, response is HTML | ngrok-free interstitial; missing `ngrok-skip-browser-warning` header | Already set in `scans-browser.tsx` fetches |
-| Reconstruction is rotated 90° | iPhone photos with EXIF rotation not baked, or COLMAP's gravity prior wrong | `scan-room.sh` runs `PIL.ImageOps.exif_transpose`; `poses._align_to_gravity` rotates the sparse model |
-| Bathroom / mirror / tile scene shows mostly floaters | SfM-hostile scene; only a couple images registered | Pick a textured room. Bathrooms are the worst case |
-| `--quality medium` rejects all images | At medium we enable `guided_matching`; on weak texture it over-prunes | Drop to `--quality low` or rely on the default we ship |
-| Worker is silent in dev.sh | `gs_pot.*` loggers not configured under uvicorn | `server.py` calls `logging.basicConfig` at import; pin level via `GS_POT_LOG_LEVEL` |
+### Manual push of an existing .ply
 
-### Endpoint quick-reference
+```bash
+uv run python -c "
+from pathlib import Path; from gs_pot.ingest import push_splat; import os
+r = push_splat(
+    Path('scenes/<scan_id>/scene.ply'),
+    ingest_url=os.environ['GS_POT_ROBOHACK_BASE'].rstrip('/') + '/api/robot/splat',
+    token=os.environ['GS_POT_INGEST_TOKEN'],
+    name='my-scene',
+)
+print(r)  # → {id: splat_…, key: splats/….ply}
+"
+```
+
+---
+
+## Motion alert — WiFi-CSI → robot bark
+
+Invoked by the agent (or by a teammate-side button bound to the agent).
+murobo polls `features.motion_band_power` from the sensing-server and runs its own
+adaptive `μ + k·σ` threshold with hysteresis. On every state flip it POSTs
+a webhook; on quiet→motion the robot also barks.
+
+### Why not just `classification.presence` from the sensing-server?
+
+The cooked classifier decays to `absent` when someone is sitting still, and
+trips on HVAC/screen noise. Live test showed Δpresence = -25.8 %-points vs.
+ground truth. Raw `motion_band_power` is clean — so we run our own
+adaptive `μ + k·σ` threshold with hysteresis.
+
+### Use it
+
+```bash
+# 1. Calibrate the empty room (stay OUT of the volume for 30s).
+curl -sX POST localhost:8000/api/motion/calibrate \
+  -H 'content-type: application/json' -d '{"seconds":30}' | jq
+
+# 2. Start. `bark.mode`: "say" (mac dev) | "afplay" | "dimos" (real robot) | "noop".
+curl -sX POST localhost:8000/api/motion/start \
+  -H 'content-type: application/json' -d '{
+    "sensing_url":"http://localhost:3000/api/v1/sensing/latest",
+    "webhook_url":"https://example.com/hook",
+    "bark":{"mode":"say"},
+    "max_duration_s":600
+  }' | jq
+
+# 3. Status / stop / test bark.
+curl -s    localhost:8000/api/motion/status | jq
+curl -sX POST localhost:8000/api/motion/stop | jq
+curl -sX POST localhost:8000/api/motion/bark -H 'content-type: application/json' -d '{}'
+```
+
+Webhook fires on both transitions; bark fires only on quiet→motion (with a 3s
+cooldown). Full body shape and tuning knobs: `gs_pot/motion.py`.
+
+> Recalibrate on every room / AP / channel / time-of-day change. The shipped
+> `motion_baseline.json` is just a seed.
+
+---
+
+## Endpoints
 
 ```
-POST /api/runs/{run_id}/process              ← the webhook
-  body (all optional, env fallback exists):
-    robohack_base, ingest_token,
-    trainer ("brush"|"opensplat"), steps, quality, scene_name
-  → 202 { scan_id, queue_depth }
-
-GET  /scans/{scan_id}                        ← live status (poll every 3s)
-  → 200 ScanInfo {
-      status: queued|capturing|poses|training|pushing|ready|error,
-      progress: 0..1,
-      detail: "downloading 5/20" | "uploading 6.1 MB (retry 2/4)" | null,
-      scene_url, thumb_url, ingest_id, ingest_key, error
-    }
-
+POST /api/runs/{run_id}/process              ← splat webhook from robohack
+GET  /scans/{scan_id}                        ← live ScanInfo (poll every 3s)
 GET  /scenes/{scan_id}.ply                   ← static binary (Spark loads this)
 GET  /scenes/{scan_id}/thumb.jpg
-GET  /web/?scene=/scenes/{scan_id}.ply       ← built-in Spark+WebXR viewer
+GET  /web/?scene=/scenes/{scan_id}.ply       ← built-in Spark + WebXR viewer
+
+POST /properties · GET /properties · GET /properties/{id}
+POST /scans      · GET /scenes
+
+POST /api/motion/calibrate                   ← empty-room baseline
+POST /api/motion/start  · POST /api/motion/stop
+GET  /api/motion/status · POST /api/motion/bark
 ```
 
-## Pushing splats to robohack (env-based, single scan)
+`/openapi.json` is the source of truth; `tests/test_contract.py` is the live spec.
 
-In production gs-pot is **the reconstruction box** for
-[robohack](https://github.com/grmkris/robohack). Their `apps/server` exposes
-a token-guarded `POST /api/robot/splat` endpoint; their `apps/web` lists the
-ingested splats via oRPC and renders them with Spark. gs-pot pushes finished
-`.ply` files there.
+---
 
-Set two env vars and the pipeline auto-pushes after every Brush export:
+## Stack picks
 
-```bash
-export GS_POT_INGEST_URL="https://<robohack-server>/api/robot/splat"
-export GS_POT_INGEST_TOKEN="<ROBOT_INGEST_TOKEN from robohack/apps/server>"
-
-# Now scans auto-upload:
-uv run python -m gs_pot scan \
-    --images ./photos/living_room \
-    --property-name "Apt 3F" \
-    --scene-name "living_room"
-# → produces scene.ply, then POSTs to /api/robot/splat with
-#   Authorization: Bearer <token>
-#   multipart: file=scene.ply, format=ply, name="Apt 3F · living_room"
-```
-
-The scan's `ingest_id` and `ingest_key` fields (visible via
-`GET /scans/{scan_id}`) record what robohack assigned. If either env var is
-missing, the push step is skipped silently — handy for local development.
-
-## Multi-property workflow (server mode)
-
-The CLI is one-shot and process-local. For persistent multi-apartment
-tracking — what the teammate's front-end uses — keep the server running
-and drive the HTTP API:
-
-```bash
-./scripts/dev.sh                    # keep this terminal running
-
-# Create an apartment:
-curl -sX POST localhost:8000/properties \
-    -H 'content-type: application/json' \
-    -d '{"name":"Apt 3F · 123 Main St","address":"123 Main St"}'
-# → {"property_id":"prop_abc123def456"}
-
-# Submit a room scan under that property:
-curl -sX POST localhost:8000/scans \
-    -H 'content-type: application/json' \
-    -d '{
-      "property_id":"prop_abc123def456",
-      "scene_name":"living_room",
-      "source":"images",
-      "images_dir":"/absolute/path/to/photos/living_room"
-    }'
-# → {"scan_id":"scn_..."}
-
-# Poll status:
-curl -s localhost:8000/scans/scn_... | jq
-
-# Get the whole property + its scans (the front-end's main read):
-curl -s localhost:8000/properties/prop_abc123def456 | jq
-```
-
-The interactive OpenAPI explorer lives at `http://localhost:8000/docs`. The
-raw spec is at `/openapi.json` — point an OpenAPI client generator at it to
-scaffold a typed client.
-
-## Motion alert: WiFi-CSI → bark
-
-The Go2 carries two ESP32 CSI sensing nodes (see
-[RuView](https://github.com/ruvnet/wifi-densepose) — WiFi-DensePose). They
-stream raw Channel-State-Information over UDP to a small Rust sensing-server
-(`wifi-densepose-sensing-server`) that emits processed features at
-`http://localhost:3000/api/v1/sensing/latest`. This section is the bridge
-that turns that stream into a single useful primitive: **"someone walked
-into the room"**, fired as an HTTP webhook and a bark from the robot.
-
-It's a parallel flow to the splat pipeline — the same gs-pot ngrok URL,
-different endpoints. Lives in [`gs_pot/motion.py`](./gs_pot/motion.py); seed
-baseline at [`motion_baseline.json`](./motion_baseline.json); tests in
-[`tests/test_motion.py`](./tests/test_motion.py).
-
-### Why it isn't just `presence: true` from the sensing-server
-
-The sensing-server *has* a `classification.presence` field, but its
-motion-based classifier is unreliable when someone is sitting still
-(it decays to `absent`) and noisy in busy rooms (HVAC, screens, and
-adjacent-room motion all trigger it). Our 4-phase empty/walk-in/still/walk-out
-test showed `Δpresence = -25.8 %-points` against ground truth — the
-classifier was *more* likely to call an empty room "occupied" than to
-recognize a person sitting at a desk.
-
-Raw `features.motion_band_power`, on the other hand, cleanly responded to
-real motion in the same test. So this bridge ignores the cooked
-classification and runs its own adaptive threshold on the raw feature:
-
-```
-threshold(t) = μ_empty + k_σ · σ_empty
-```
-
-with `μ` and `σ` continuously re-estimated from samples that the detector
-itself has labelled "quiet". Hysteresis gates state flips (`hyst_motion_ms`
-to enter MOTION, `hyst_quiet_ms` to leave) so a single above-threshold sample
-from a sudden Fresnel-fringe spike doesn't trigger a false bark.
-
-### Quickstart (assumes sensing-server already running on :3000)
-
-```bash
-# 1. Calibrate the empty-room baseline. Be OUT of the sensing volume
-#    for the duration; default is 30s.
-curl -s -X POST http://localhost:8000/api/motion/calibrate \
-  -H 'content-type: application/json' \
-  -d '{"seconds": 30}' | jq
-
-# → {
-#     "baseline": {"mean": 59.7, "std": 3.7, "n_samples": 60, ...},
-#     "raw_n_samples": 60, "trimmed_n_samples": 54,
-#     "persisted_to": "motion_baseline.json"
-#   }
-
-# 2. Start the monitor. `webhook_url` is where each transition is POSTed.
-#    `bark.mode` is `say` (macOS dev), `dimos` (real robot), or `afplay`.
-curl -s -X POST http://localhost:8000/api/motion/start \
-  -H 'content-type: application/json' \
-  -d '{
-        "sensing_url":  "http://localhost:3000/api/v1/sensing/latest",
-        "webhook_url":  "https://example.com/motion-hook",
-        "bark":         {"mode": "say"},
-        "max_duration_s": 600
-      }' | jq
-
-# → {"status": "started", "threshold": 64.51, "bark_mode": "say", ...}
-
-# 3. Poll status (live counters, current state).
-curl -s http://localhost:8000/api/motion/status | jq
-
-# 4. Stop when done.
-curl -s -X POST http://localhost:8000/api/motion/stop | jq
-
-# 5. One-off audio test, no sensing required.
-curl -s -X POST http://localhost:8000/api/motion/bark \
-  -H 'content-type: application/json' -d '{}' | jq
-```
-
-### Endpoints
-
-| Verb   | Path                        | Purpose |
-|--------|-----------------------------|---------|
-| `POST` | `/api/motion/calibrate`     | Block-sample the empty room for N seconds, save baseline |
-| `POST` | `/api/motion/start`         | Kick off the monitor in a background thread (202 if newly started, 202 + `status:already_running` if a monitor is already up) |
-| `POST` | `/api/motion/stop`          | Stop the monitor; returns transition + bark counts |
-| `GET`  | `/api/motion/status`        | Current state (`quiet` / `motion`), threshold, last sample, baseline |
-| `POST` | `/api/motion/bark`          | Fire one bark immediately (for audio-path validation) |
-
-### Webhook payload
-
-Each transition POSTs:
-
-```json
-{
-  "type": "gs_pot.motion_transition",
-  "transition": {
-    "from": "quiet",
-    "to": "motion",
-    "at": 1779976234.5,
-    "prev_dwell_s": 47.2,
-    "value": 86.9,
-    "threshold": 64.5,
-    "baseline": {"mean": 60.0, "std": 3.7, "n": 60}
-  },
-  "source": {
-    "url":   "http://localhost:3000/api/v1/sensing/latest",
-    "field": "features.motion_band_power"
-  },
-  "saved_baseline": {
-    "mean": 59.7, "std": 3.7, "n_samples": 60,
-    "captured_at": "2026-05-28T13:55:00Z",
-    "source_url": "http://localhost:3000/api/v1/sensing/latest"
-  }
-}
-```
-
-Both `quiet → motion` and `motion → quiet` transitions are POSTed; only
-`quiet → motion` triggers a bark (with a configurable `cooldown_s`, default
-3s, to avoid bark spam on chattering Fresnel zones).
-
-### Bark modes
-
-| Mode      | What it does                                                          | Where it shipps |
-|-----------|-----------------------------------------------------------------------|------------------|
-| `say`     | `say -v Fred "WOOF! WOOF! WOOF!"` (macOS TTS)                         | Mac dev box     |
-| `afplay`  | `afplay <audio_path>` — drop in a real bark.wav and point at it       | Mac dev box     |
-| `dimos`   | `dimos mcp call UnitreeSpeak --arg text="bark bark"` (configurable)   | On the Go2      |
-| `noop`    | Silent — webhook fires, robot stays quiet                             | Testing         |
-
-The DimOS command is fully configurable via `bark.dimos_cmd` in the start
-request; default is the one above. If the configured binary isn't on PATH,
-the module falls back to `say` and logs a warning so the bridge keeps working
-in dev mode.
-
-### Production flow (ngrok → gs-pot → robot)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor U as Operator
-    participant Ext as External repo<br/>(robohack, ops dashboard, ...)
-    participant Ng as ngrok
-    participant GS as gs-pot @ :8000
-    participant CSI as sensing-server @ :3000
-    participant ESP as ESP32 nodes<br/>on Go2
-    participant Go2 as Go2 (DimOS speaker)
-
-    U->>Ext: "arm motion alert"
-    Ext->>Ng: POST /api/motion/calibrate {seconds: 30}
-    Ng->>GS: forwards
-    loop 30s
-        GS->>CSI: GET /api/v1/sensing/latest
-        CSI-->>GS: features.motion_band_power
-    end
-    GS-->>Ext: {baseline: {mean, std, ...}, persisted_to: "motion_baseline.json"}
-
-    Ext->>Ng: POST /api/motion/start {webhook_url, bark.mode:"dimos"}
-    Ng->>GS: forwards
-    GS-->>Ext: 202 {status:"started", threshold, bark_mode}
-
-    par background
-        loop poll @ 2 Hz
-            ESP-->>CSI: UDP CSI frames
-            GS->>CSI: GET /sensing/latest
-            CSI-->>GS: motion_band_power
-            Note over GS: detector.push(value)
-        end
-    end
-
-    Note over GS: quiet → motion transition (k_σ · σ above adaptive μ for hyst_motion_ms)
-    GS->>Go2: dimos mcp call UnitreeSpeak<br/>(or `say` in dev)
-    Go2-->>U: 🐶  Bark!
-    GS->>Ext: POST webhook_url {transition, baseline}
-
-    U->>Ext: "disarm"
-    Ext->>Ng: POST /api/motion/stop
-    Ng->>GS: forwards
-    GS-->>Ext: {status:"stopped", transitions, barks}
-```
-
-### Calibrate, redux
-
-Recalibration is **necessary** every time the environment changes meaningfully
-— different room, different access point, different Mac, different Wi-Fi
-channel, different time of day. The seed baseline shipped in
-`motion_baseline.json` is just a starting point so the monitor can boot
-without an explicit calibrate call; in practice always run
-`POST /api/motion/calibrate` before arming. Trim defaults to 5% of samples
-on each tail so accidentally stepping briefly into the volume mid-calibration
-doesn't poison the noise floor.
-
-### Knobs (request body shape)
-
-```jsonc
-{
-  "sensing_url": "http://localhost:3000/api/v1/sensing/latest",
-  "webhook_url": "https://example.com/hook",
-  "max_duration_s": 600,                  // null = run until /stop
-  "detector": {
-    "k_sigma":           1.3,             // alert at μ + k·σ
-    "hyst_motion_ms":    1500,            // ms above-threshold to enter MOTION
-    "hyst_quiet_ms":     5000,            // ms below-threshold to leave MOTION
-    "rolling_window_size": 60,            // ≈30s @ 2Hz
-    "poll_ms":           500,
-    "std_floor":         2.0              // prevents hair-trigger when σ→0
-  },
-  "bark": {
-    "mode":       "dimos",                // "say" | "afplay" | "dimos" | "noop"
-    "audio_path": null,                   // afplay target if mode=afplay
-    "say_phrase": "WOOF! WOOF! WOOF!",
-    "say_voice":  "Fred",
-    "dimos_cmd":  ["dimos","mcp","call","UnitreeSpeak","--arg","text=bark bark"],
-    "cooldown_s": 3.0
-  },
-  "baseline_override": null               // pass {mean,std,...} to skip the saved file
-}
-```
-
-The seed values came from a live empty-room recording on the hackathon Mac
-(see `c.txt` and `motion_baseline.json`). They're tuned for the *radio*, not
-the *room* — recalibrate.
-
-## API contract (summary)
-
-| Verb | Path | Purpose |
+| Concern | Pick | Why |
 |---|---|---|
-| `POST` | `/properties` | Create an apartment / listing |
-| `GET`  | `/properties` | List all + their scans |
-| `GET`  | `/properties/{id}` | One property + its scans |
-| `POST` | `/scans` | Start a scan (kicks off the pipeline in a background thread) |
-| `GET`  | `/scans/{id}` | Status (`queued` → `poses` → `training` → `ready` / `error`) + `scene_url` once ready |
-| `GET`  | `/scenes` | All `ready` scans (flat) |
-| `GET`  | `/scenes/{id}.ply` | The splat asset |
-| `POST` | `/api/motion/calibrate` | Sample empty room, save baseline (see *Motion alert* above) |
-| `POST` | `/api/motion/start` | Start motion bridge (202) |
-| `POST` | `/api/motion/stop` | Stop motion bridge |
-| `GET`  | `/api/motion/status` | Current motion-bridge state |
-| `POST` | `/api/motion/bark` | Fire one test bark |
-| `GET`  | `/scenes/{id}/thumb.jpg` | Thumbnail |
+| Trainer | [Brush 0.3.0][brush] | Rust/WGPU on Metal — no CUDA dep, ships on a Mac. |
+| Poses | [pycolmap][] (not the CLI) | Homebrew's macOS arm64 COLMAP has a SIFT-matcher SIGSEGV. |
+| Viewer | [Spark 2.0][spark] | Three.js + WebGL2; WebXR on Quest 3 + Vision Pro; LoD streams to 100M splats. |
+| CSI nodes | ESP32-S3 + [RuView][ruview] | Off-the-shelf $5 boards; UDP CSI → laptop. Pinned to a 2.4 GHz AP (the S3 has no 5 GHz radio). |
+| Detector | Custom `μ + k·σ` + hysteresis | The sensing-server's cooked `presence` field was -25.8 %-pts vs. ground truth; raw `motion_band_power` is clean. |
+| API | FastAPI + uvicorn | OpenAPI spec is the teammate's client-gen input. |
 
-`tests/test_contract.py` is the **live spec** — 18 tests run by
-`uv run pytest`. If the teammate's client breaks, one of those should
-have failed first.
+Apple-Silicon-first; venue laptop with CUDA can swap to gsplat — see [CLAUDE.md](./CLAUDE.md).
+
+[brush]: https://github.com/ArthurBrussee/brush
+[pycolmap]: https://github.com/colmap/pycolmap
+[ruview]: https://github.com/ruvnet/wifi-densepose
+
+---
 
 ## Project layout
 
 ```
 gs_pot/
-  models.py          # pydantic types — the contract
-  store.py           # in-memory Property + Scan registries
-  server.py          # FastAPI: /properties, /scans, /scenes, mounts /web
-  pipeline.py        # orchestrator: poses → train → push → thumb → READY
-  poses.py           # COLMAP subprocess wrapper (CPU mode, no CUDA)
-  train.py           # Brush subprocess wrapper
-  ingest.py          # POST .ply to robohack's /api/robot/splat (Bearer auth)
-  thumb.py           # first-image → JPG thumbnail
-  cli.py             # `python -m gs_pot scan ...`
-tests/
-  test_contract.py   # producer/consumer API contract tests
-  test_ingest.py     # robohack push contract (multipart, Bearer, format/name)
-web/                 # Spark 2.0 + WebXR smoke viewer (mounted at /web)
-scripts/dev.sh       # uvicorn launcher
-bin/                 # external binaries — gitignored, see bin/README.md
-scenes/              # per-scan workspace + outputs — gitignored
+  models.py    pipeline.py   poses.py      train.py
+  ingest.py    motion.py     server.py     store.py
+  runs.py      thumb.py      cli.py
+tests/         test_contract.py · test_ingest.py · test_motion.py · …
+web/           Spark 2.0 + WebXR smoke viewer (mounted at /web)
+scripts/       dev.sh · scan-room.sh
+bin/           Brush + OpenSplat binaries (gitignored — see bin/README.md)
+scenes/        per-scan workspaces + outputs (gitignored)
 ```
 
-## Stack picks (and why)
+---
 
-| Concern | Pick | Why |
+<details>
+<summary><b>COLMAP quality presets</b></summary>
+
+| Preset | Image size | Max SIFT | Guided matching | BA iters (local/global) |
+|---|---|---|---|---|
+| `low`     | 1000 px | 2048  | off | 12 / 30  |
+| `medium`  | 1600 px | 8192  | off | 16 / 50  |
+| `high`    | 2400 px | 16384 | on  | 25 / 75  |
+| `extreme` | 3200 px | 32768 | on  | 40 / 100 (OPENCV camera) |
+
+**Counter-intuitive:** for weak-texture scenes (bathrooms, white walls,
+tile, mirrors), `low` often registers **more** images than `medium`/`high`.
+`guided_matching` prunes against a noisy initial epipolar geometry and
+the mapper fails to find a seed pair. Start `low`, promote up.
+
+</details>
+
+<details>
+<summary><b>Trainer choice — Brush vs OpenSplat</b></summary>
+
+Both consume the same COLMAP workspace and emit a Spark-compatible `.ply`.
+Swap with `--trainer`.
+
+| | Brush 0.3.0 | OpenSplat |
 |---|---|---|
-| Trainer | [Brush][] 0.3.0 | Rust/WGPU runs on Mac (Metal) / Linux / Web; no CUDA dependency; "faster than gsplat" per their README. |
-| Poses | COLMAP `automatic_reconstructor` | Sparse-only (`--dense 0`); GPU off (`--use_gpu 0`) so Mac works. |
-| Viewer | [Spark][] 2.0 | Three.js + WebGL2; confirmed WebXR on Quest 3 + Vision Pro; LoD streaming to 100M splats. |
-| API | FastAPI + uvicorn | The auto-generated OpenAPI spec is the teammate's client-gen input. |
+| Backend | Rust / WGPU → Metal | C++ / libtorch native Metal |
+| Install | drop-in binary | `brew install cmake opencv pytorch` + cmake (~15 min) |
+| M4 Max speed | 15k ≈ 29 min (9 photos) | 2k ≈ ~5 min (3–5× faster) |
+| Convergence | 5k–15k gradient steps | 2k–5k iterations |
+| License | Apache-2.0 + MIT | AGPLv3 |
 
-These reflect an Apple-Silicon-first dev box (no CUDA). The venue laptop may
-differ; see CLAUDE.md for the CUDA-path swap.
+Brush is the default — always works, no build. OpenSplat is the speed path
+once you're iterating.
 
-[Brush]: https://github.com/ArthurBrussee/brush
+</details>
 
-## RuView ESP32-S3 node provisioning (CSI through-wall sensing)
+<details>
+<summary><b>What you'll see in <code>dev.sh</code></b></summary>
 
-Sister capability we run alongside the splat pipeline at the hackathon: a pair
-of ESP32-S3 boards stream WiFi Channel State Information to a laptop that
-turns it into presence / motion / vital-signs sensing through walls. Useful
-as an inspection-/security-domain hook on top of the real-estate splat demo.
+```
+INFO  uvicorn.access     "POST /api/runs/scan-…/process HTTP/1.1" 202
+INFO  gs_pot.runs        run scan-…: 120 frames to fetch
+INFO  gs_pot.runs        run scan-…: 120 frames in scenes/scn_…/images_src
+INFO  gs_pot.poses       pycolmap: extract_features (size=1000, features=2048)
+INFO  gs_pot.poses       pycolmap: match_exhaustive
+INFO  gs_pot.poses       pycolmap: incremental_mapping
+INFO  gs_pot.poses       gravity-align: rotated 120 cameras (|mean down|=0.97)
+INFO  gs_pot.train       running: bin/brush scenes/scn_… --total-steps 7000
+INFO  gs_pot.train       Brush exported: scenes/scn_…/scene.ply
+INFO  gs_pot.ingest      pushing scene.ply (6.1 MB) → /api/robot/splat
+WARN  gs_pot.ingest      push got 502 on attempt 1/4, retrying in 2.0s
+INFO  gs_pot.ingest      ingest accepted on attempt 2/4: id=splat_…
+INFO  gs_pot.pipeline    [scn_…] DONE
+```
 
-Reproducible record of how we brought the CSI nodes up, from bare boards to a
-live sensing feed on the laptop. Repeat the [Per-node](#2-per-node-flash--provision-repeat-for-node-0-then-node-1)
-section for each node.
+</details>
 
-**Environment:** macOS (Apple Silicon), Homebrew `python3`, `esptool` v5.2,
-RuView repo cloned at `~/code/RuView`. Two ESP32-S3 "AI" boards (16 MB flash).
+<details>
+<summary><b>Failure modes + fixes</b></summary>
 
-### What each node ends up doing
+| Symptom | Cause | Fix |
+|---|---|---|
+| `502 Bad Gateway` mid-push | Railway edge hiccup on large multipart | Retry-with-backoff handles it; otherwise re-push the on-disk `.ply` |
+| `/api/scans/<run>` returns 404 HTML | Old Caddyfile didn't route `/api/scans*` to apps/server | Fixed; redeploy gateway |
+| Brush panic `min > max, or NaN` | `steps=2000` too low for Brush's lr schedule | Fixed: Brush default 7000 |
+| CORS error, response is HTML | ngrok-free interstitial | Send `ngrok-skip-browser-warning: true` |
+| Reconstruction rotated 90° | EXIF rotation not baked / wrong COLMAP gravity prior | `scan-room.sh` calls `PIL.ImageOps.exif_transpose`; `poses._align_to_gravity` rotates the sparse model |
+| Bathroom / mirror scene → all floaters | Only a couple images registered (SfM-hostile) | Pick a textured room; bathrooms are worst-case |
+| `--quality medium` rejects all images | `guided_matching` over-prunes weak texture | Drop to `--quality low` |
+| Worker silent in dev.sh | `gs_pot.*` loggers not configured | `server.py` calls `logging.basicConfig` at import |
 
-Captures WiFi Channel State Information (CSI), runs edge processing, and
-streams results over UDP to the laptop, which runs the RuView sensing-server
-(HTTP dashboard + WebSocket).
+</details>
 
-### 0. Network (do this first)
+<details>
+<summary><b>RuView ESP32-S3 node provisioning</b> (CSI sensing nodes — first-time bring-up)</summary>
 
-ESP32-S3 has **no 5 GHz radio**, and venue WiFi usually has client isolation
-— so we use an **iPhone Personal Hotspot forced to 2.4 GHz**:
+Two ESP32-S3 "AI" boards (16 MB flash), macOS Apple Silicon, RuView repo at `~/code/RuView`.
 
-1. iPhone → Settings → Personal Hotspot → **turn ON "Maximize Compatibility"** (forces 2.4 GHz).
-2. Join the Mac to that hotspot (`XiPhone2`).
-3. Get the Mac's IP on the hotspot — this is the **sink IP** the nodes stream to:
-   ```bash
-   ipconfig getifaddr en0      # e.g. 172.20.10.5
-   ```
+**0. Network — any 2.4 GHz hotspot (ESP32-S3 has no 5 GHz radio).**
+- We used a personal hotspot with "Maximize Compatibility" forced to 2.4 GHz.
+- Join Mac to the hotspot. `ipconfig getifaddr en0` → sink IP (e.g. `172.20.10.5`).
+- Keep Mac on the hotspot for the whole session.
 
-> Keep the Mac on the hotspot the whole time, or the node→laptop stream dies.
-
-### 1. One-time tooling (macOS)
-
-Homebrew Python is "externally managed," so install with `--break-system-packages --user`:
-
+**1. Tools (one-time).**
 ```bash
 python3 -m pip install --break-system-packages --user esptool esp-idf-nvs-partition-gen
 ```
 
-(`esptool` flashes/provisions over serial; `esp-idf-nvs-partition-gen` builds
-the NVS config blob.)
-
-### 2. Per-node: flash + provision (repeat for node 0, then node 1)
-
-Plug **one** board in at a time so there's only one serial port to deal with.
-
-#### 2a. Find the serial port
-
+**2. Per node — plug ONE board in, then:**
 ```bash
-ls /dev/cu.usbmodem*          # e.g. /dev/cu.usbmodem1101
-```
+# Find port
+ls /dev/cu.usbmodem*                # → /dev/cu.usbmodem1101
 
-Use that path as `<PORT>` below. (ESP32-S3 uses native USB; usually no driver needed.)
-
-#### 2b. Confirm the chip / flash size
-
-```bash
+# Confirm chip
 python3 -m esptool --chip esp32s3 --port <PORT> flash-id
-```
 
-Ours reported **16 MB**. We flash the **8 MB binary set anyway** — it works
-fine on a 16 MB chip (uses the first 8 MB). For genuine 4 MB boards, use the
-`*-4mb.bin` variants + `--flash_size 4MB`.
-
-#### 2c. Flash the RuView firmware
-
-> The boards shipped with **xiaozhi (小智) AI firmware** (`Application/WifiBoard: Free internal…`
-> logs). We overwrite it with RuView's prebuilt binaries from `release_bins/`.
-
-```bash
+# Flash RuView firmware (overwrites the xiaozhi 小智 AI firmware boards ship with)
 python3 -m esptool --chip esp32s3 --port <PORT> --baud 460800 \
   write_flash --flash_mode dio --flash_size 8MB \
   0x0     firmware/esp32-csi-node/release_bins/bootloader.bin \
   0x8000  firmware/esp32-csi-node/release_bins/partition-table.bin \
   0xf000  firmware/esp32-csi-node/release_bins/ota_data_initial.bin \
   0x20000 firmware/esp32-csi-node/release_bins/esp32-csi-node.bin
-```
 
-(The `write_flash` / `--flash_mode` deprecation warnings from esptool v5.2 are harmless.)
-
-#### 2d. Provision WiFi creds + sink + identity (writes NVS, no reflash)
-
-```bash
+# Provision WiFi / sink / identity (NVS write, no reflash)
 python3 firmware/esp32-csi-node/provision.py --port <PORT> \
-  --ssid XiPhone2 --password '<HOTSPOT_PASSWORD>' \
+  --ssid murobo24 --password '<PASS>' \
   --target-ip 172.20.10.5 --target-port 5005 \
-  --node-id <ID> --tdm-slot <SLOT> --tdm-total 2
+  --node-id <0|1> --tdm-slot <0|1> --tdm-total 2
+
+# Verify boot
+python3 -m serial.tools.miniterm <PORT> 115200
+# → "wifi:state … -> run ch=6", "csi_collector: cb #… len=128", "stream → 172.20.10.5:5005"
+# exit Ctrl-]
 ```
 
-Per-node values:
+| Node | `--node-id` | `--tdm-slot` | MAC |
+|---|---|---|---|
+| 0 | 0 | 0 | `98:a3:16:f2:a7:80` |
+| 1 | 1 | 1 | `9c:13:9e:a9:f2:0c` |
 
-| Node | `--node-id` | `--tdm-slot` | MAC (observed) |
-|------|-------------|--------------|----------------|
-| 0    | `0`         | `0`          | `98:a3:16:f2:a7:80` |
-| 1    | `1`         | `1`          | `9c:13:9e:a9:f2:0c` |
-
-`--tdm-total 2` + distinct slots time-divide the two nodes so they don't
-collide. Success prints `NVS provisioning complete!` and the board hard-resets.
-
-#### 2e. Verify the node booted and connected (serial monitor)
-
+**3. Verify UDP arrives on the Mac.**
 ```bash
-python3 -m serial.tools.miniterm /dev/cu.usbmodem<PORT> 115200
-```
-
-Tap RESET on the board to see a fresh boot. **Good signs:**
-
-- `wifi:state … -> run` settling on `ch=6` (joined `XiPhone2` on 2.4 GHz)
-- `csi_collector: CSI cb #… len=128 …` (capturing CSI)
-- `edge_proc: Adaptive calibration complete … threshold=…`
-- `main: CSI streaming active → 172.20.10.5:5005`
-
-Exit miniterm with **Ctrl-]**.
-
-> Notes:
-> - `OSError: [Errno 6] Device not configured` on reset is harmless — the S3's USB re-enumerates; just re-run.
-> - `stream_sender: sendto failed: errno 118` means the node hasn't joined WiFi yet (no route). It clears once `… -> run` sticks. If it never connects, double-check the password and that the hotspot has a free device slot (iPhone caps ~5 devices).
-
-### 3. Verify both nodes reach the Mac (UDP)
-
-The nodes only need **power** to run (any USB port/charger/battery) — node 0
-can live on a second machine; it still streams to `172.20.10.5`. With both
-powered:
-
-```bash
-cat > /tmp/udprecv.py << 'EOF'
+python3 -c "
 import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(("0.0.0.0", 5005))
-print("listening on udp/5005 ...")
-n = 0
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0',5005))
+print('listening'); n=0
 while True:
-    d, a = s.recvfrom(65535)
-    n += 1
-    print(f"#{n}  {len(d)} bytes from {a[0]}:{a[1]}")
-EOF
-python3 /tmp/udprecv.py
+    d,a = s.recvfrom(65535); n+=1; print(f'#{n} {len(d)}B from {a[0]}:{a[1]}')
+"
+# → packets from two distinct 172.20.10.x source IPs.
 ```
 
-You should see packets from **two** different `172.20.10.x` source IPs. **Ctrl-C**
-to stop — and free port 5005 before starting the server (only one process can bind it).
-
-### 4. Run the sensing server
-
+**4. Run the sensing-server.**
 ```bash
-pkill -f udprecv.py 2>/dev/null     # free UDP 5005
-
+pkill -f udprecv 2>/dev/null
 docker run --rm -p 3000:3000 -p 3001:3001 -p 5005:5005/udp \
   -e CSI_SOURCE=esp32 ruvnet/wifi-densepose:latest
+# Dashboard: http://localhost:3000/ui/index.html
+# WS frames: ws://localhost:3001/ws/sensing  (~12 Hz)
+# Useful fields: features.motion_band_power, classification.presence, vital_signs.*
+# (persons[].pose is synthetic, confidence=0 — ignore)
 ```
 
-Server endpoints (note the exact paths):
+**Re-provision** any time: just re-run step 2's `provision.py`. No reflash.
 
-- **Dashboard:** `http://localhost:3000/ui/index.html`
-- **WebSocket:** `ws://localhost:3001/ws/sensing`
-- **UDP ingest:** `0.0.0.0:5005`
+</details>
 
-### 5. View / test the live feed
-
-- Open the dashboard and watch presence/motion react.
-- Inspect raw WS frames:
-  ```bash
-  npx wscat -c ws://localhost:3001/ws/sensing
-  ```
-- Frames are `type: "sensing_update"` (~12 Hz). Useful fields:
-  `features.motion_band_power`, `classification.presence`, `classification.motion_level`,
-  `estimated_persons`, `vital_signs.*`. (Pose under `persons[]` is synthetic — `confidence: 0` — ignore it.)
-
-### Quick reference
-
-| Item | Value |
-|---|---|
-| Hotspot SSID | `XiPhone2` (2.4 GHz, Maximize Compatibility ON) |
-| Mac / sink IP | `172.20.10.5` |
-| UDP port | `5005` |
-| Firmware | `release_bins/` set, offsets `0x0 / 0x8000 / 0xf000 / 0x20000`, `--flash_size 8MB` |
-| Node 0 | id 0, slot 0/2, MAC `98:a3:16:f2:a7:80` |
-| Node 1 | id 1, slot 1/2, MAC `9c:13:9e:a9:f2:0c` |
-| Serial monitor | `python3 -m serial.tools.miniterm <PORT> 115200` (exit `Ctrl-]`) |
-| Re-provision | re-run step 2d (no reflash needed) |
+---
 
 ## See also
 
-- [FLOWS.md](./FLOWS.md) — Mermaid sequence diagrams for the CLI, HTTP, and webhook flows + the status state machine.
-- [CLAUDE.md](./CLAUDE.md) — full build plan, pipeline diagram, open decisions, collaboration rules.
-- [robohack][robohack] — parent repo with hackathon strategy + research papers.
-- RuView (cloned locally at `~/code/RuView`) — the CSI sensing repo whose firmware + server we drive from the runbook above.
+- [CLAUDE.md](./CLAUDE.md) — full build plan, decision matrix, collaboration rules
+- [FLOWS.md](./FLOWS.md) — Mermaid sequence diagrams for the CLI / HTTP / webhook / status state machine
+- [robohack][robohack] — parent hackathon repo
+- [Spark][spark] · [Brush][brush] · [pycolmap][] — the load-bearing dependencies
