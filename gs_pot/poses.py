@@ -11,6 +11,7 @@ On-disk workspace layout is unchanged too, so Brush keeps reading it.
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -59,17 +60,17 @@ _QUALITY_PRESETS: dict[Quality, dict[str, Any]] = {
 }
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
+_VIDEO_FRAME_RE = re.compile(r"^frame[_-]?\d+\.(jpg|jpeg|png)$", re.IGNORECASE)
 
-# Minimum SfM output Brush will actually accept. The Brush panic
-# (`min > max, NaN` in a clamp) is specifically triggered by a zero-extent
-# scene — 1 point at one position → `max_scale = 0`. Three-camera /
-# ~100-point sparse reconstructions train fine (verified in the wild:
-# scn_abe593bb8fb9 ran 2k steps to a 0.1 MB ply). So the thresholds err
-# very low — we only want to reject the truly unreconstructable cases,
-# not narrow-baseline-but-valid ones.
-_MIN_REG_IMAGES = 2
-_MIN_3D_POINTS = 10
-_MIN_SCENE_DIAGONAL = 0.01
+
+def _looks_like_video_frames(image_dir: Path) -> bool:
+    """True if ≥90% of staged images match `frame_NNNN.jpg` — sequential matching
+    is the right call (O(N·k) instead of O(N²))."""
+    files = [p for p in image_dir.iterdir() if p.suffix.lower() in _IMG_EXTS]
+    if len(files) < 10:
+        return False
+    hits = sum(1 for p in files if _VIDEO_FRAME_RE.match(p.name))
+    return hits / len(files) >= 0.9
 
 
 def _stage_images(image_dir: Path, workspace_images: Path) -> int:
@@ -121,13 +122,8 @@ def _align_to_gravity(sparse_dir: Path) -> None:
     COLMAP/OpenCV camera frame: +X right, +Y down, +Z forward. So the camera's
     'down' direction in world space is the second row of R_w2c. Averaging
     across all registered images gives a robust gravity estimate when the
-    user shot the scene roughly upright.
-
-    Rotation only — no rescaling. Scene-scale normalisation was tried (target
-    diagonal 1.5) but regressed sets whose COLMAP scale was already moderate
-    (ali_b1_living_: 47 splats → 4 with normalisation). The OPENCV camera
-    model in go2_mode was the actual cause of ballooning scale, not a
-    pipeline-wide issue, so we drop both that and the normalisation.
+    user shot the scene roughly upright — which is the common case for both
+    iPhone walkthroughs and a Go2 with a horizontally-mounted head.
     """
     rec = pycolmap.Reconstruction(str(sparse_dir))
     poses = [img.cam_from_world() for img in rec.images.values() if img.has_pose]
@@ -139,6 +135,8 @@ def _align_to_gravity(sparse_dir: Path) -> None:
     gravity = down_world.mean(axis=0)
     norm = float(np.linalg.norm(gravity))
     if norm < 0.3:
+        # Cameras pointing in wildly different directions — gravity not
+        # recoverable from the up-axis heuristic. Bail without rotating.
         log.warning(
             "gravity-align: weak signal (|mean down|=%.2f over %d poses); skipping",
             norm, len(poses),
@@ -153,32 +151,6 @@ def _align_to_gravity(sparse_dir: Path) -> None:
     log.info(
         "gravity-align: rotated %d cameras + %d points (|mean down|=%.2f)",
         len(poses), len(rec.points3D), norm,
-    )
-
-
-def _check_reconstruction_sane(sparse_dir: Path, input_image_count: int) -> None:
-    """Raise with a useful message if the SfM output is too degenerate for Brush."""
-    rec = pycolmap.Reconstruction(str(sparse_dir))
-    reg = rec.num_reg_images()
-    n_pts = rec.num_points3D()
-    diag = 0.0
-    if n_pts > 0:
-        coords = np.array([p.xyz for p in rec.points3D.values()])
-        diag = float(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)))
-    if reg < _MIN_REG_IMAGES or n_pts < _MIN_3D_POINTS or diag < _MIN_SCENE_DIAGONAL:
-        raise RuntimeError(
-            "SfM reconstruction too degenerate to train a splat from. "
-            f"registered={reg}/{input_image_count} images, "
-            f"3D points={n_pts}, scene diagonal={diag:.4f}. "
-            "Likely causes: pure-rotation capture (no baseline → can't "
-            "triangulate), weak texture (mirrors / glass / blank walls), "
-            "too few angles per stop, low-resolution frames, or motion "
-            "blur. Try a textured scene with more overlap between "
-            "consecutive shots."
-        )
-    log.info(
-        "SfM sanity: registered=%d/%d points=%d diagonal=%.3f — passing to trainer",
-        reg, input_image_count, n_pts, diag,
     )
 
 
@@ -199,13 +171,6 @@ def run_colmap(
                 cameras.bin
                 images.bin
                 points3D.bin
-
-    A previous `go2_mode` toggle that bumped SIFT features, switched to OPENCV,
-    and loosened mapper thresholds was removed — those overrides admitted
-    weak-geometry frames that poisoned Brush training on phone-walk inputs
-    (ali_b1_living_: 1,419 splats → 4–47). The Go2-specific tuning lives only
-    in scripts/scan-go2.py now, called explicitly when you know the input is
-    a Go2 narrow-baseline panorama.
     """
     workspace.mkdir(parents=True, exist_ok=True)
     workspace_images = workspace / "images"
@@ -239,18 +204,32 @@ def run_colmap(
         ),
         reader_options=reader_opts,
         extraction_options=ext_opts,
-        device=pycolmap.Device.cpu,
+        device=pycolmap.Device.auto,
     )
 
-    # 2. Exhaustive matching
-    log.info("pycolmap: match_exhaustive (guided=%s)", preset["guided_matching"])
+    # 2. Matching — sequential for video frames (filename pattern frame_\d+),
+    # exhaustive otherwise. Sequential is O(N·k) instead of O(N²); for 200
+    # video frames that's ~2000 pairs vs ~20,000.
     match_opts = pycolmap.FeatureMatchingOptions()
     match_opts.guided_matching = preset["guided_matching"]
-    pycolmap.match_exhaustive(
-        database_path=database,
-        matching_options=match_opts,
-        device=pycolmap.Device.cpu,
-    )
+    use_sequential = _looks_like_video_frames(workspace_images)
+    if use_sequential:
+        log.info("pycolmap: match_sequential (video-frame pattern detected)")
+        pair_opts = pycolmap.SequentialPairingOptions()
+        pair_opts.overlap = 15  # match each frame against ±15 neighbours
+        pycolmap.match_sequential(
+            database_path=database,
+            matching_options=match_opts,
+            pairing_options=pair_opts,
+            device=pycolmap.Device.auto,
+        )
+    else:
+        log.info("pycolmap: match_exhaustive (guided=%s)", preset["guided_matching"])
+        pycolmap.match_exhaustive(
+            database_path=database,
+            matching_options=match_opts,
+            device=pycolmap.Device.auto,
+        )
 
     # 3. Incremental SfM
     sparse_root = workspace / "sparse"
@@ -273,23 +252,12 @@ def run_colmap(
             "Common causes: too few overlapping images, repetitive textures, "
             "mirrors/glass, motion blur."
         )
-    # COLMAP can output multiple disjoint reconstructions; pick the largest by
-    # registered-camera count. Brush reads `sparse/0/` by convention, so the
-    # picked model must live there.
-    best = max(models, key=lambda d: len(pycolmap.Reconstruction(str(d)).images))
-    if best.name != "0":
-        target = sparse_root / "0"
-        if target.exists():
-            target.rename(sparse_root / f"0.discarded_{target.stat().st_mtime_ns}")
-        best.rename(target)
-        best = target
     log.info(
-        "COLMAP sparse model: %s (%d reconstruction(s) total, kept largest)",
-        best, len(reconstructions),
+        "COLMAP sparse model: %s (%d reconstruction(s) total)",
+        models[0], len(reconstructions),
     )
-    _check_reconstruction_sane(best, n_linked)
-    _align_to_gravity(best)
-    return best
+    _align_to_gravity(models[0])
+    return models[0]
 
 
 def colmap_available() -> bool:
