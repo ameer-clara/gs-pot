@@ -1,0 +1,8 @@
+{
+  "mean": 59.7,
+  "std": 3.7,
+  "n_samples": 60,
+  "captured_at": "2026-05-28T13:55:00Z",
+  "source_url": "http://localhost:3000/api/v1/sensing/latest",
+  "note": "Seed baseline ported from c3cu motion-alert v2 (empty-room middle of phase A + middle of phase D of the 4-phase walk-in test). Recalibrate via POST /api/motion/calibrate before each deployment."
+}

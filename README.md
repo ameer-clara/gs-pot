@@ -591,6 +591,227 @@ The interactive OpenAPI explorer lives at `http://localhost:8000/docs`. The
 raw spec is at `/openapi.json` — point an OpenAPI client generator at it to
 scaffold a typed client.
 
+## Motion alert: WiFi-CSI → bark
+
+The Go2 carries two ESP32 CSI sensing nodes (see
+[RuView](https://github.com/ruvnet/wifi-densepose) — WiFi-DensePose). They
+stream raw Channel-State-Information over UDP to a small Rust sensing-server
+(`wifi-densepose-sensing-server`) that emits processed features at
+`http://localhost:3000/api/v1/sensing/latest`. This section is the bridge
+that turns that stream into a single useful primitive: **"someone walked
+into the room"**, fired as an HTTP webhook and a bark from the robot.
+
+It's a parallel flow to the splat pipeline — the same gs-pot ngrok URL,
+different endpoints. Lives in [`gs_pot/motion.py`](./gs_pot/motion.py); seed
+baseline at [`motion_baseline.json`](./motion_baseline.json); tests in
+[`tests/test_motion.py`](./tests/test_motion.py).
+
+### Why it isn't just `presence: true` from the sensing-server
+
+The sensing-server *has* a `classification.presence` field, but its
+motion-based classifier is unreliable when someone is sitting still
+(it decays to `absent`) and noisy in busy rooms (HVAC, screens, and
+adjacent-room motion all trigger it). Our 4-phase empty/walk-in/still/walk-out
+test showed `Δpresence = -25.8 %-points` against ground truth — the
+classifier was *more* likely to call an empty room "occupied" than to
+recognize a person sitting at a desk.
+
+Raw `features.motion_band_power`, on the other hand, cleanly responded to
+real motion in the same test. So this bridge ignores the cooked
+classification and runs its own adaptive threshold on the raw feature:
+
+```
+threshold(t) = μ_empty + k_σ · σ_empty
+```
+
+with `μ` and `σ` continuously re-estimated from samples that the detector
+itself has labelled "quiet". Hysteresis gates state flips (`hyst_motion_ms`
+to enter MOTION, `hyst_quiet_ms` to leave) so a single above-threshold sample
+from a sudden Fresnel-fringe spike doesn't trigger a false bark.
+
+### Quickstart (assumes sensing-server already running on :3000)
+
+```bash
+# 1. Calibrate the empty-room baseline. Be OUT of the sensing volume
+#    for the duration; default is 30s.
+curl -s -X POST http://localhost:8000/api/motion/calibrate \
+  -H 'content-type: application/json' \
+  -d '{"seconds": 30}' | jq
+
+# → {
+#     "baseline": {"mean": 59.7, "std": 3.7, "n_samples": 60, ...},
+#     "raw_n_samples": 60, "trimmed_n_samples": 54,
+#     "persisted_to": "motion_baseline.json"
+#   }
+
+# 2. Start the monitor. `webhook_url` is where each transition is POSTed.
+#    `bark.mode` is `say` (macOS dev), `dimos` (real robot), or `afplay`.
+curl -s -X POST http://localhost:8000/api/motion/start \
+  -H 'content-type: application/json' \
+  -d '{
+        "sensing_url":  "http://localhost:3000/api/v1/sensing/latest",
+        "webhook_url":  "https://example.com/motion-hook",
+        "bark":         {"mode": "say"},
+        "max_duration_s": 600
+      }' | jq
+
+# → {"status": "started", "threshold": 64.51, "bark_mode": "say", ...}
+
+# 3. Poll status (live counters, current state).
+curl -s http://localhost:8000/api/motion/status | jq
+
+# 4. Stop when done.
+curl -s -X POST http://localhost:8000/api/motion/stop | jq
+
+# 5. One-off audio test, no sensing required.
+curl -s -X POST http://localhost:8000/api/motion/bark \
+  -H 'content-type: application/json' -d '{}' | jq
+```
+
+### Endpoints
+
+| Verb   | Path                        | Purpose |
+|--------|-----------------------------|---------|
+| `POST` | `/api/motion/calibrate`     | Block-sample the empty room for N seconds, save baseline |
+| `POST` | `/api/motion/start`         | Kick off the monitor in a background thread (202 if newly started, 202 + `status:already_running` if a monitor is already up) |
+| `POST` | `/api/motion/stop`          | Stop the monitor; returns transition + bark counts |
+| `GET`  | `/api/motion/status`        | Current state (`quiet` / `motion`), threshold, last sample, baseline |
+| `POST` | `/api/motion/bark`          | Fire one bark immediately (for audio-path validation) |
+
+### Webhook payload
+
+Each transition POSTs:
+
+```json
+{
+  "type": "gs_pot.motion_transition",
+  "transition": {
+    "from": "quiet",
+    "to": "motion",
+    "at": 1779976234.5,
+    "prev_dwell_s": 47.2,
+    "value": 86.9,
+    "threshold": 64.5,
+    "baseline": {"mean": 60.0, "std": 3.7, "n": 60}
+  },
+  "source": {
+    "url":   "http://localhost:3000/api/v1/sensing/latest",
+    "field": "features.motion_band_power"
+  },
+  "saved_baseline": {
+    "mean": 59.7, "std": 3.7, "n_samples": 60,
+    "captured_at": "2026-05-28T13:55:00Z",
+    "source_url": "http://localhost:3000/api/v1/sensing/latest"
+  }
+}
+```
+
+Both `quiet → motion` and `motion → quiet` transitions are POSTed; only
+`quiet → motion` triggers a bark (with a configurable `cooldown_s`, default
+3s, to avoid bark spam on chattering Fresnel zones).
+
+### Bark modes
+
+| Mode      | What it does                                                          | Where it shipps |
+|-----------|-----------------------------------------------------------------------|------------------|
+| `say`     | `say -v Fred "WOOF! WOOF! WOOF!"` (macOS TTS)                         | Mac dev box     |
+| `afplay`  | `afplay <audio_path>` — drop in a real bark.wav and point at it       | Mac dev box     |
+| `dimos`   | `dimos mcp call UnitreeSpeak --arg text="bark bark"` (configurable)   | On the Go2      |
+| `noop`    | Silent — webhook fires, robot stays quiet                             | Testing         |
+
+The DimOS command is fully configurable via `bark.dimos_cmd` in the start
+request; default is the one above. If the configured binary isn't on PATH,
+the module falls back to `say` and logs a warning so the bridge keeps working
+in dev mode.
+
+### Production flow (ngrok → gs-pot → robot)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Operator
+    participant Ext as External repo<br/>(robohack, ops dashboard, ...)
+    participant Ng as ngrok
+    participant GS as gs-pot @ :8000
+    participant CSI as sensing-server @ :3000
+    participant ESP as ESP32 nodes<br/>on Go2
+    participant Go2 as Go2 (DimOS speaker)
+
+    U->>Ext: "arm motion alert"
+    Ext->>Ng: POST /api/motion/calibrate {seconds: 30}
+    Ng->>GS: forwards
+    loop 30s
+        GS->>CSI: GET /api/v1/sensing/latest
+        CSI-->>GS: features.motion_band_power
+    end
+    GS-->>Ext: {baseline: {mean, std, ...}, persisted_to: "motion_baseline.json"}
+
+    Ext->>Ng: POST /api/motion/start {webhook_url, bark.mode:"dimos"}
+    Ng->>GS: forwards
+    GS-->>Ext: 202 {status:"started", threshold, bark_mode}
+
+    par background
+        loop poll @ 2 Hz
+            ESP-->>CSI: UDP CSI frames
+            GS->>CSI: GET /sensing/latest
+            CSI-->>GS: motion_band_power
+            Note over GS: detector.push(value)
+        end
+    end
+
+    Note over GS: quiet → motion transition (k_σ · σ above adaptive μ for hyst_motion_ms)
+    GS->>Go2: dimos mcp call UnitreeSpeak<br/>(or `say` in dev)
+    Go2-->>U: 🐶  Bark!
+    GS->>Ext: POST webhook_url {transition, baseline}
+
+    U->>Ext: "disarm"
+    Ext->>Ng: POST /api/motion/stop
+    Ng->>GS: forwards
+    GS-->>Ext: {status:"stopped", transitions, barks}
+```
+
+### Calibrate, redux
+
+Recalibration is **necessary** every time the environment changes meaningfully
+— different room, different access point, different Mac, different Wi-Fi
+channel, different time of day. The seed baseline shipped in
+`motion_baseline.json` is just a starting point so the monitor can boot
+without an explicit calibrate call; in practice always run
+`POST /api/motion/calibrate` before arming. Trim defaults to 5% of samples
+on each tail so accidentally stepping briefly into the volume mid-calibration
+doesn't poison the noise floor.
+
+### Knobs (request body shape)
+
+```jsonc
+{
+  "sensing_url": "http://localhost:3000/api/v1/sensing/latest",
+  "webhook_url": "https://example.com/hook",
+  "max_duration_s": 600,                  // null = run until /stop
+  "detector": {
+    "k_sigma":           1.3,             // alert at μ + k·σ
+    "hyst_motion_ms":    1500,            // ms above-threshold to enter MOTION
+    "hyst_quiet_ms":     5000,            // ms below-threshold to leave MOTION
+    "rolling_window_size": 60,            // ≈30s @ 2Hz
+    "poll_ms":           500,
+    "std_floor":         2.0              // prevents hair-trigger when σ→0
+  },
+  "bark": {
+    "mode":       "dimos",                // "say" | "afplay" | "dimos" | "noop"
+    "audio_path": null,                   // afplay target if mode=afplay
+    "say_phrase": "WOOF! WOOF! WOOF!",
+    "say_voice":  "Fred",
+    "dimos_cmd":  ["dimos","mcp","call","UnitreeSpeak","--arg","text=bark bark"],
+    "cooldown_s": 3.0
+  },
+  "baseline_override": null               // pass {mean,std,...} to skip the saved file
+}
+```
+
+The seed values came from a live empty-room recording on the hackathon Mac
+(see `c.txt` and `motion_baseline.json`). They're tuned for the *radio*, not
+the *room* — recalibrate.
+
 ## API contract (summary)
 
 | Verb | Path | Purpose |
@@ -602,6 +823,11 @@ scaffold a typed client.
 | `GET`  | `/scans/{id}` | Status (`queued` → `poses` → `training` → `ready` / `error`) + `scene_url` once ready |
 | `GET`  | `/scenes` | All `ready` scans (flat) |
 | `GET`  | `/scenes/{id}.ply` | The splat asset |
+| `POST` | `/api/motion/calibrate` | Sample empty room, save baseline (see *Motion alert* above) |
+| `POST` | `/api/motion/start` | Start motion bridge (202) |
+| `POST` | `/api/motion/stop` | Stop motion bridge |
+| `GET`  | `/api/motion/status` | Current motion-bridge state |
+| `POST` | `/api/motion/bark` | Fire one test bark |
 | `GET`  | `/scenes/{id}/thumb.jpg` | Thumbnail |
 
 `tests/test_contract.py` is the **live spec** — 18 tests run by
@@ -644,8 +870,193 @@ differ; see CLAUDE.md for the CUDA-path swap.
 
 [Brush]: https://github.com/ArthurBrussee/brush
 
+## RuView ESP32-S3 node provisioning (CSI through-wall sensing)
+
+Sister capability we run alongside the splat pipeline at the hackathon: a pair
+of ESP32-S3 boards stream WiFi Channel State Information to a laptop that
+turns it into presence / motion / vital-signs sensing through walls. Useful
+as an inspection-/security-domain hook on top of the real-estate splat demo.
+
+Reproducible record of how we brought the CSI nodes up, from bare boards to a
+live sensing feed on the laptop. Repeat the [Per-node](#2-per-node-flash--provision-repeat-for-node-0-then-node-1)
+section for each node.
+
+**Environment:** macOS (Apple Silicon), Homebrew `python3`, `esptool` v5.2,
+RuView repo cloned at `~/code/RuView`. Two ESP32-S3 "AI" boards (16 MB flash).
+
+### What each node ends up doing
+
+Captures WiFi Channel State Information (CSI), runs edge processing, and
+streams results over UDP to the laptop, which runs the RuView sensing-server
+(HTTP dashboard + WebSocket).
+
+### 0. Network (do this first)
+
+ESP32-S3 has **no 5 GHz radio**, and venue WiFi usually has client isolation
+— so we use an **iPhone Personal Hotspot forced to 2.4 GHz**:
+
+1. iPhone → Settings → Personal Hotspot → **turn ON "Maximize Compatibility"** (forces 2.4 GHz).
+2. Join the Mac to that hotspot (`XiPhone2`).
+3. Get the Mac's IP on the hotspot — this is the **sink IP** the nodes stream to:
+   ```bash
+   ipconfig getifaddr en0      # e.g. 172.20.10.5
+   ```
+
+> Keep the Mac on the hotspot the whole time, or the node→laptop stream dies.
+
+### 1. One-time tooling (macOS)
+
+Homebrew Python is "externally managed," so install with `--break-system-packages --user`:
+
+```bash
+python3 -m pip install --break-system-packages --user esptool esp-idf-nvs-partition-gen
+```
+
+(`esptool` flashes/provisions over serial; `esp-idf-nvs-partition-gen` builds
+the NVS config blob.)
+
+### 2. Per-node: flash + provision (repeat for node 0, then node 1)
+
+Plug **one** board in at a time so there's only one serial port to deal with.
+
+#### 2a. Find the serial port
+
+```bash
+ls /dev/cu.usbmodem*          # e.g. /dev/cu.usbmodem1101
+```
+
+Use that path as `<PORT>` below. (ESP32-S3 uses native USB; usually no driver needed.)
+
+#### 2b. Confirm the chip / flash size
+
+```bash
+python3 -m esptool --chip esp32s3 --port <PORT> flash-id
+```
+
+Ours reported **16 MB**. We flash the **8 MB binary set anyway** — it works
+fine on a 16 MB chip (uses the first 8 MB). For genuine 4 MB boards, use the
+`*-4mb.bin` variants + `--flash_size 4MB`.
+
+#### 2c. Flash the RuView firmware
+
+> The boards shipped with **xiaozhi (小智) AI firmware** (`Application/WifiBoard: Free internal…`
+> logs). We overwrite it with RuView's prebuilt binaries from `release_bins/`.
+
+```bash
+python3 -m esptool --chip esp32s3 --port <PORT> --baud 460800 \
+  write_flash --flash_mode dio --flash_size 8MB \
+  0x0     firmware/esp32-csi-node/release_bins/bootloader.bin \
+  0x8000  firmware/esp32-csi-node/release_bins/partition-table.bin \
+  0xf000  firmware/esp32-csi-node/release_bins/ota_data_initial.bin \
+  0x20000 firmware/esp32-csi-node/release_bins/esp32-csi-node.bin
+```
+
+(The `write_flash` / `--flash_mode` deprecation warnings from esptool v5.2 are harmless.)
+
+#### 2d. Provision WiFi creds + sink + identity (writes NVS, no reflash)
+
+```bash
+python3 firmware/esp32-csi-node/provision.py --port <PORT> \
+  --ssid XiPhone2 --password '<HOTSPOT_PASSWORD>' \
+  --target-ip 172.20.10.5 --target-port 5005 \
+  --node-id <ID> --tdm-slot <SLOT> --tdm-total 2
+```
+
+Per-node values:
+
+| Node | `--node-id` | `--tdm-slot` | MAC (observed) |
+|------|-------------|--------------|----------------|
+| 0    | `0`         | `0`          | `98:a3:16:f2:a7:80` |
+| 1    | `1`         | `1`          | `9c:13:9e:a9:f2:0c` |
+
+`--tdm-total 2` + distinct slots time-divide the two nodes so they don't
+collide. Success prints `NVS provisioning complete!` and the board hard-resets.
+
+#### 2e. Verify the node booted and connected (serial monitor)
+
+```bash
+python3 -m serial.tools.miniterm /dev/cu.usbmodem<PORT> 115200
+```
+
+Tap RESET on the board to see a fresh boot. **Good signs:**
+
+- `wifi:state … -> run` settling on `ch=6` (joined `XiPhone2` on 2.4 GHz)
+- `csi_collector: CSI cb #… len=128 …` (capturing CSI)
+- `edge_proc: Adaptive calibration complete … threshold=…`
+- `main: CSI streaming active → 172.20.10.5:5005`
+
+Exit miniterm with **Ctrl-]**.
+
+> Notes:
+> - `OSError: [Errno 6] Device not configured` on reset is harmless — the S3's USB re-enumerates; just re-run.
+> - `stream_sender: sendto failed: errno 118` means the node hasn't joined WiFi yet (no route). It clears once `… -> run` sticks. If it never connects, double-check the password and that the hotspot has a free device slot (iPhone caps ~5 devices).
+
+### 3. Verify both nodes reach the Mac (UDP)
+
+The nodes only need **power** to run (any USB port/charger/battery) — node 0
+can live on a second machine; it still streams to `172.20.10.5`. With both
+powered:
+
+```bash
+cat > /tmp/udprecv.py << 'EOF'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", 5005))
+print("listening on udp/5005 ...")
+n = 0
+while True:
+    d, a = s.recvfrom(65535)
+    n += 1
+    print(f"#{n}  {len(d)} bytes from {a[0]}:{a[1]}")
+EOF
+python3 /tmp/udprecv.py
+```
+
+You should see packets from **two** different `172.20.10.x` source IPs. **Ctrl-C**
+to stop — and free port 5005 before starting the server (only one process can bind it).
+
+### 4. Run the sensing server
+
+```bash
+pkill -f udprecv.py 2>/dev/null     # free UDP 5005
+
+docker run --rm -p 3000:3000 -p 3001:3001 -p 5005:5005/udp \
+  -e CSI_SOURCE=esp32 ruvnet/wifi-densepose:latest
+```
+
+Server endpoints (note the exact paths):
+
+- **Dashboard:** `http://localhost:3000/ui/index.html`
+- **WebSocket:** `ws://localhost:3001/ws/sensing`
+- **UDP ingest:** `0.0.0.0:5005`
+
+### 5. View / test the live feed
+
+- Open the dashboard and watch presence/motion react.
+- Inspect raw WS frames:
+  ```bash
+  npx wscat -c ws://localhost:3001/ws/sensing
+  ```
+- Frames are `type: "sensing_update"` (~12 Hz). Useful fields:
+  `features.motion_band_power`, `classification.presence`, `classification.motion_level`,
+  `estimated_persons`, `vital_signs.*`. (Pose under `persons[]` is synthetic — `confidence: 0` — ignore it.)
+
+### Quick reference
+
+| Item | Value |
+|---|---|
+| Hotspot SSID | `XiPhone2` (2.4 GHz, Maximize Compatibility ON) |
+| Mac / sink IP | `172.20.10.5` |
+| UDP port | `5005` |
+| Firmware | `release_bins/` set, offsets `0x0 / 0x8000 / 0xf000 / 0x20000`, `--flash_size 8MB` |
+| Node 0 | id 0, slot 0/2, MAC `98:a3:16:f2:a7:80` |
+| Node 1 | id 1, slot 1/2, MAC `9c:13:9e:a9:f2:0c` |
+| Serial monitor | `python3 -m serial.tools.miniterm <PORT> 115200` (exit `Ctrl-]`) |
+| Re-provision | re-run step 2d (no reflash needed) |
+
 ## See also
 
 - [FLOWS.md](./FLOWS.md) — Mermaid sequence diagrams for the CLI, HTTP, and webhook flows + the status state machine.
 - [CLAUDE.md](./CLAUDE.md) — full build plan, pipeline diagram, open decisions, collaboration rules.
 - [robohack][robohack] — parent repo with hackathon strategy + research papers.
+- RuView (cloned locally at `~/code/RuView`) — the CSI sensing repo whose firmware + server we drive from the runbook above.

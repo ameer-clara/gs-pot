@@ -37,6 +37,20 @@ from .models import (
     ScanStatus,
     Trainer,
 )
+from .motion import (
+    BarkRequest,
+    MotionCalibrateRequest,
+    MotionCalibrateResponse,
+    MotionStartRequest,
+    MotionStartResponse,
+    MotionStatus,
+    MotionStopResponse,
+    calibrate_sync,
+    current_status,
+    fire_bark,
+    start_monitor,
+    stop_monitor,
+)
 from .pipeline import run_scan
 from .runs import fetch_run
 from .store import get_property_store, get_store
@@ -262,7 +276,6 @@ def _process_run_job(
             trainer=trainer,  # type: ignore[arg-type]
             ingest_url=f"{robohack_base.rstrip('/')}/api/robot/splat",
             ingest_token=ingest_token,
-            go2_mode=True,  # webhook flow == Go2 capture: single camera, low-res, wide FOV
         )
     except Exception as exc:
         log.exception("[%s] run %s processing failed", scan_id, run_id)
@@ -343,6 +356,72 @@ def process_run(run_id: str, req: ProcessRunRequest) -> ProcessRunResponse:
         quality=req.quality,
     )
     return ProcessRunResponse(scan_id=scan_id, queue_depth=depth)
+
+
+# ── Motion-alert endpoints (c3cu mode) ────────────────────────────────────────
+#
+# Background: a WiFi-CSI sensing-server (Rust + Axum, see RuView/c3cu) emits
+# `features.motion_band_power` from the ESP32 nodes mounted on the robot.
+# When the robot is sitting in a room with the sensing-server running, this
+# bridge polls that feature, scores it against an adaptive empty-room baseline,
+# and on a quiet→motion flip barks (via DimOS / local `say` / a .wav) and
+# POSTs the transition to the caller-supplied webhook.
+#
+# Typical flow from an external repo through ngrok:
+#   POST /api/motion/calibrate {seconds:30}             — empty room sample
+#   POST /api/motion/start     {webhook_url:"..."}      — kick off, 202-style
+#   POST /api/motion/stop                               — halt
+# See "Motion alert: WiFi-CSI → bark" in README.md for the full walk-through.
+
+
+@app.post("/api/motion/start", response_model=MotionStartResponse, status_code=202)
+def motion_start(req: MotionStartRequest) -> MotionStartResponse:
+    try:
+        status, mon = start_monitor(req)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return MotionStartResponse(
+        status=status,
+        started_at=mon.started_at,
+        sensing_url=mon.sensing_url,
+        baseline=mon.baseline,
+        threshold=mon.detector.threshold,
+        webhook_url=mon.webhook_url,
+        bark_mode=mon.bark_cfg.mode,
+    )
+
+
+@app.post("/api/motion/stop", response_model=MotionStopResponse)
+def motion_stop() -> MotionStopResponse:
+    return stop_monitor()
+
+
+@app.get("/api/motion/status", response_model=MotionStatus)
+def motion_status() -> MotionStatus:
+    return current_status()
+
+
+@app.post("/api/motion/calibrate", response_model=MotionCalibrateResponse)
+def motion_calibrate(req: MotionCalibrateRequest) -> MotionCalibrateResponse:
+    """Block until calibration is complete (~`seconds` long).
+
+    Sample motion_band_power for the duration, trim outliers, save baseline
+    to disk (unless persist=false). Call this with the sensing volume empty.
+    """
+    try:
+        return calibrate_sync(req)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@app.post("/api/motion/bark", status_code=200)
+def motion_bark(req: BarkRequest) -> dict[str, Any]:
+    """Fire one bark immediately. Useful to validate the audio path."""
+    cfg = req.bark
+    if cfg is None:
+        from .motion import BarkConfig
+        cfg = BarkConfig()
+    return fire_bark(cfg)
 
 
 # ── Scene asset endpoints ─────────────────────────────────────────────────────

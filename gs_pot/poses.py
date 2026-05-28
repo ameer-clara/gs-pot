@@ -121,8 +121,13 @@ def _align_to_gravity(sparse_dir: Path) -> None:
     COLMAP/OpenCV camera frame: +X right, +Y down, +Z forward. So the camera's
     'down' direction in world space is the second row of R_w2c. Averaging
     across all registered images gives a robust gravity estimate when the
-    user shot the scene roughly upright — which is the common case for both
-    iPhone walkthroughs and a Go2 with a horizontally-mounted head.
+    user shot the scene roughly upright.
+
+    Rotation only — no rescaling. Scene-scale normalisation was tried (target
+    diagonal 1.5) but regressed sets whose COLMAP scale was already moderate
+    (ali_b1_living_: 47 splats → 4 with normalisation). The OPENCV camera
+    model in go2_mode was the actual cause of ballooning scale, not a
+    pipeline-wide issue, so we drop both that and the normalisation.
     """
     rec = pycolmap.Reconstruction(str(sparse_dir))
     poses = [img.cam_from_world() for img in rec.images.values() if img.has_pose]
@@ -134,8 +139,6 @@ def _align_to_gravity(sparse_dir: Path) -> None:
     gravity = down_world.mean(axis=0)
     norm = float(np.linalg.norm(gravity))
     if norm < 0.3:
-        # Cameras pointing in wildly different directions — gravity not
-        # recoverable from the up-axis heuristic. Bail without rotating.
         log.warning(
             "gravity-align: weak signal (|mean down|=%.2f over %d poses); skipping",
             norm, len(poses),
@@ -185,7 +188,6 @@ def run_colmap(
     *,
     quality: Quality = "medium",
     single_camera: bool = False,
-    go2_mode: bool = False,
 ) -> Path:
     """Run COLMAP via pycolmap. Returns the sparse model dir.
 
@@ -197,6 +199,13 @@ def run_colmap(
                 cameras.bin
                 images.bin
                 points3D.bin
+
+    A previous `go2_mode` toggle that bumped SIFT features, switched to OPENCV,
+    and loosened mapper thresholds was removed — those overrides admitted
+    weak-geometry frames that poisoned Brush training on phone-walk inputs
+    (ali_b1_living_: 1,419 splats → 4–47). The Go2-specific tuning lives only
+    in scripts/scan-go2.py now, called explicitly when you know the input is
+    a Go2 narrow-baseline panorama.
     """
     workspace.mkdir(parents=True, exist_ok=True)
     workspace_images = workspace / "images"
@@ -207,18 +216,7 @@ def run_colmap(
         )
     log.info("staged %d images at %s", n_linked, workspace_images)
 
-    preset = dict(_QUALITY_PRESETS[quality])
-    # Go2 mode: same physical camera every shot, wider FOV, 640×360 frames.
-    # Override the preset to the proven scan-go2.py settings. Keeps existing
-    # phone-photo flows untouched.
-    if go2_mode:
-        preset["camera_model"] = "OPENCV"
-        preset["max_image_size"] = max(preset["max_image_size"], 1024)
-        preset["max_num_features"] = max(preset["max_num_features"], 16384)
-        preset["guided_matching"] = True
-        single_camera = True
-        log.info("Go2 mode: OPENCV/SINGLE camera, 16k features, guided matching")
-
+    preset = _QUALITY_PRESETS[quality]
     database = workspace / "database.db"
     if database.exists():
         database.unlink()
@@ -261,14 +259,6 @@ def run_colmap(
     map_opts = pycolmap.IncrementalPipelineOptions()
     map_opts.ba_local_max_num_iterations = preset["ba_local_max_num_iterations"]
     map_opts.ba_global_max_num_iterations = preset["ba_global_max_num_iterations"]
-    if go2_mode:
-        # Narrow-baseline rotation-heavy captures need lenient registration
-        # thresholds; mirrors scripts/scan-go2.py.
-        map_opts.min_model_size = 3
-        map_opts.min_num_matches = 10
-        map_opts.mapper.init_min_num_inliers = 30
-        map_opts.mapper.abs_pose_min_num_inliers = 10
-        map_opts.mapper.init_min_tri_angle = 1.0
     reconstructions = pycolmap.incremental_mapping(
         database_path=database,
         image_path=workspace_images,
