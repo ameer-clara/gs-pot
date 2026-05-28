@@ -131,14 +131,24 @@ def _align_to_gravity(sparse_dir: Path) -> None:
         log.warning("gravity-align: no registered poses, skipping")
         return
 
-    down_world = np.stack([p.rotation.matrix()[1, :] for p in poses])
-    gravity = down_world.mean(axis=0)
-    norm = float(np.linalg.norm(gravity))
+    # A camera held with little roll keeps the axis pointing along gravity
+    # consistent across views, while panning scrambles the horizontal + forward
+    # axes. So of the three camera axes, the one with the largest mean magnitude
+    # (in world space, = rows of the world→cam rotation) is 'down'. This
+    # auto-detects the orientation instead of assuming camera +Y: landscape
+    # shots resolve to +Y, portrait ones (e.g. iPhone EXIF orientation 6, where
+    # COLMAP reports Gravity X≈1) resolve to +X — which previously rolled the
+    # whole scene 90°.
+    mats = np.stack([p.rotation.matrix() for p in poses])  # (N,3,3) world→cam
+    axis_means = [mats[:, i, :].mean(axis=0) for i in range(3)]
+    axis_norms = [float(np.linalg.norm(m)) for m in axis_means]
+    axis = int(np.argmax(axis_norms))
+    gravity = axis_means[axis]
+    norm = axis_norms[axis]
     if norm < 0.3:
-        # Cameras pointing in wildly different directions — gravity not
-        # recoverable from the up-axis heuristic. Bail without rotating.
+        # No camera axis is consistent — gravity not recoverable. Bail.
         log.warning(
-            "gravity-align: weak signal (|mean down|=%.2f over %d poses); skipping",
+            "gravity-align: weak signal (max |mean axis|=%.2f over %d poses); skipping",
             norm, len(poses),
         )
         return
@@ -149,8 +159,8 @@ def _align_to_gravity(sparse_dir: Path) -> None:
     rec.transform(sim3d)
     rec.write(str(sparse_dir))
     log.info(
-        "gravity-align: rotated %d cameras + %d points (|mean down|=%.2f)",
-        len(poses), len(rec.points3D), norm,
+        "gravity-align: rotated %d cameras + %d points (down=cam-axis-%d, |mean|=%.2f)",
+        len(poses), len(rec.points3D), axis, norm,
     )
 
 
@@ -252,12 +262,26 @@ def run_colmap(
             "Common causes: too few overlapping images, repetitive textures, "
             "mirrors/glass, motion blur."
         )
+
+    # COLMAP can split a scene into several disjoint sub-models (sparse/0,
+    # sparse/1, …) and the first directory is NOT necessarily the largest —
+    # guided matching on weakly-overlapping sets often buries the best
+    # reconstruction in sparse/1. Pick the one with the most registered images.
+    # Downstream consumers (Brush, OpenSplat, the scan summary) all read
+    # sparse/0, so make the chosen model canonical there.
+    best = max(models, key=lambda d: pycolmap.Reconstruction(str(d)).num_reg_images())
+    canonical = sparse_root / "0"
+    if best != canonical:
+        swap = sparse_root / "_swap"
+        canonical.rename(swap)
+        best.rename(canonical)
+        swap.rename(best)  # park the old sparse/0 at the now-free index
     log.info(
-        "COLMAP sparse model: %s (%d reconstruction(s) total)",
-        models[0], len(reconstructions),
+        "COLMAP: kept largest of %d sub-model(s) at sparse/0 (%d registered images)",
+        len(models), pycolmap.Reconstruction(str(canonical)).num_reg_images(),
     )
-    _align_to_gravity(models[0])
-    return models[0]
+    _align_to_gravity(canonical)
+    return canonical
 
 
 def colmap_available() -> bool:

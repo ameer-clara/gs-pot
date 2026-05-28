@@ -124,7 +124,10 @@ class ProcessRunRequest(BaseModel):
     # schedule when total_steps drops much below ~5000; OpenSplat converges
     # ~3× faster per iteration so 2000 is its sweet spot.
     steps: int | None = Field(default=None, ge=500, le=60000)
-    quality: str = Field(default="low", pattern=r"^(low|medium|high|extreme)$")
+    # `medium` (1600px, 8192 features) is the validated default: it produced the
+    # dense reference splats (ali-b1-p → 535k splats). `low` under-reconstructs
+    # — keep it as an explicit opt-in for fast/throwaway previews only.
+    quality: str = Field(default="medium", pattern=r"^(low|medium|high|extreme)$")
 
 
 class ProcessRunResponse(BaseModel):
