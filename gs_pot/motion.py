@@ -41,8 +41,38 @@ BASELINE_FILE = Path(
 DEFAULT_SENSING_URL = "http://localhost:3000/api/v1/sensing/latest"
 DEFAULT_FIELD_PATH = ("features", "motion_band_power")
 
+# Resolved relative to the repo root (gs_pot/ → ..). Env override lets
+# operators drop a different wav in without editing code.
+_DEFAULT_BARK_WAV = Path(__file__).resolve().parent.parent / "audio" / "mixkit-medium-size-angry-dog-bark-54.wav"
+
+
+def _default_bark_audio_path() -> str | None:
+    override = os.environ.get("GS_POT_BARK_AUDIO_PATH")
+    if override:
+        return override
+    return str(_DEFAULT_BARK_WAV) if _DEFAULT_BARK_WAV.exists() else None
+
 
 # ── Pydantic API models ───────────────────────────────────────────────────────
+
+
+class PhaseStats(BaseModel):
+    n: int
+    mean: float
+    std: float
+    min: float
+    max: float
+    p5: float
+    p95: float
+
+
+class MotionProfile(BaseModel):
+    """Per-phase stats captured during multi-phase calibration."""
+
+    empty: PhaseStats | None = None
+    walk_in: PhaseStats | None = None
+    walk_around: PhaseStats | None = None
+    still_in_room: PhaseStats | None = None
 
 
 class Baseline(BaseModel):
@@ -52,26 +82,43 @@ class Baseline(BaseModel):
     captured_at: datetime
     source_url: str
     note: str | None = None
+    # Populated only by multi-phase calibration — old single-phase baselines
+    # round-trip cleanly through the same model.
+    motion_profile: MotionProfile | None = None
+    recommended_k_sigma: float | None = None
+    recommended_threshold: float | None = None
+    overlap_warning: str | None = None
 
 
 class DetectorConfig(BaseModel):
-    k_sigma: float = Field(default=1.3, gt=0)
-    hyst_motion_ms: int = Field(default=1500, ge=0)
-    hyst_quiet_ms: int = Field(default=5000, ge=0)
-    rolling_window_size: int = Field(default=60, ge=6)
+    # Defaults are tuned for the hackathon room/desk geometry where the
+    # baseline is "person sitting at desk" and walking away makes the WiFi-CSI
+    # signal DROP (see README "Motion alert" section, signal-physics paragraph).
+    # Override any of these in the /api/motion/start request body.
+    #
+    # k_sigma:  When None — use baseline.recommended_k_sigma if set, else 0.7.
+    #           Explicitly passing a number always wins.
+    k_sigma: float | None = Field(default=None, gt=0)
+    hyst_motion_ms: int = Field(default=800, ge=0)
+    hyst_quiet_ms: int = Field(default=2000, ge=0)
+    rolling_window_size: int = Field(default=30, ge=6)
     poll_ms: int = Field(default=500, ge=100)
     std_floor: float = Field(default=2.0, gt=0)
+    # When True, "motion" means value DROPS below threshold (μ − k·σ) instead
+    # of rises above it. Default True for the desk-geometry where signal goes
+    # down when you leave the desk.
+    invert: bool = True
 
 
 class BarkConfig(BaseModel):
-    mode: Literal["dimos", "afplay", "say", "noop"] = "say"
-    audio_path: str | None = None
+    mode: Literal["dimos", "afplay", "say", "noop"] = "afplay"
+    audio_path: str | None = Field(default_factory=_default_bark_audio_path)
     say_phrase: str = "WOOF! WOOF! WOOF!"
     say_voice: str = "Fred"
     dimos_cmd: list[str] = Field(
         default_factory=lambda: ["dimos", "mcp", "call", "UnitreeSpeak", "--arg", "text=bark bark"]
     )
-    cooldown_s: float = 3.0
+    cooldown_s: float = 1.0
 
 
 class MotionStartRequest(BaseModel):
@@ -132,6 +179,32 @@ class MotionCalibrateResponse(BaseModel):
     persisted_to: str | None
 
 
+class CalibratePhaseSpec(BaseModel):
+    name: Literal["empty", "walk_in", "walk_around", "still_in_room"]
+    seconds: int = Field(ge=5, le=600)
+
+
+class MotionCalibrateMultiRequest(BaseModel):
+    sensing_url: str = DEFAULT_SENSING_URL
+    phases: list[CalibratePhaseSpec] = Field(
+        default_factory=lambda: [
+            CalibratePhaseSpec(name="empty", seconds=30),
+            CalibratePhaseSpec(name="walk_in", seconds=8),
+            CalibratePhaseSpec(name="walk_around", seconds=30),
+            CalibratePhaseSpec(name="still_in_room", seconds=20),
+        ]
+    )
+    poll_ms: int = Field(default=500, ge=100)
+    audio_cues: bool = True
+    persist: bool = True
+
+
+class MotionCalibrateMultiResponse(BaseModel):
+    baseline: Baseline  # already includes motion_profile + recommendation
+    persisted_to: str | None
+    total_seconds: int
+
+
 class BarkRequest(BaseModel):
     bark: BarkConfig | None = None
 
@@ -145,6 +218,15 @@ class MotionDetector:
         self._seed_std = max(baseline.std, 1.0)
         self._cfg = cfg
 
+        # Effective k_sigma resolution order:
+        #   explicit cfg.k_sigma  >  baseline.recommended_k_sigma  >  0.7 (room default)
+        if cfg.k_sigma is not None:
+            self.effective_k_sigma = cfg.k_sigma
+        elif baseline.recommended_k_sigma is not None:
+            self.effective_k_sigma = baseline.recommended_k_sigma
+        else:
+            self.effective_k_sigma = 0.7
+
         self._quiet_buf: deque[float] = deque(maxlen=cfg.rolling_window_size)
         self.mean = self._seed_mean
         self.std = self._seed_std
@@ -157,7 +239,9 @@ class MotionDetector:
 
     @property
     def threshold(self) -> float:
-        return self.mean + self._cfg.k_sigma * self.std
+        # Inverted: threshold sits BELOW the baseline mean (motion = drop).
+        sign = -1.0 if self._cfg.invert else 1.0
+        return self.mean + sign * self.effective_k_sigma * self.std
 
     def _refresh_stats(self) -> None:
         if len(self._quiet_buf) < 6:
@@ -171,8 +255,12 @@ class MotionDetector:
     def push(self, value: float, now_ms: int | None = None) -> dict[str, Any] | None:
         """Feed one sample. Returns a transition dict on state flip, else None."""
         now_ms = _now_ms() if now_ms is None else now_ms
-        above = value > self.threshold
-        obs: Literal["quiet", "motion"] = "motion" if above else "quiet"
+        # Inverted detector: "motion" means value DROPS below threshold.
+        if self._cfg.invert:
+            is_motion_sample = value < self.threshold
+        else:
+            is_motion_sample = value > self.threshold
+        obs: Literal["quiet", "motion"] = "motion" if is_motion_sample else "quiet"
 
         if obs != self._cand_state:
             self._cand_state = obs
@@ -336,6 +424,160 @@ def calibrate_sync(req: MotionCalibrateRequest) -> MotionCalibrateResponse:
     )
 
 
+# ── Multi-phase calibration ──────────────────────────────────────────────────
+
+# Lead-in seconds at the start of each phase: discarded from stats so the
+# `say` cue and operator's reaction time don't pollute the distribution.
+PHASE_LEAD_IN_S = 3.0
+
+PHASE_CUES: dict[str, str] = {
+    "empty": "Empty room calibration. Step out now.",
+    "walk_in": "Walk into the room now.",
+    "walk_around": "Keep walking around.",
+    "still_in_room": "Stop walking. Stay still.",
+}
+
+
+def _say_async(phrase: str, voice: str = "Fred") -> None:
+    """Non-blocking macOS TTS. No-op if `say` isn't on PATH."""
+    if shutil.which("say") is None:
+        return
+    subprocess.Popen(
+        ["say", "-v", voice, "-r", "200", phrase],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _percentile(sorted_samples: list[float], q: float) -> float:
+    """Nearest-rank percentile (q in [0,1])."""
+    if not sorted_samples:
+        return 0.0
+    idx = max(0, min(len(sorted_samples) - 1, int(q * (len(sorted_samples) - 1))))
+    return sorted_samples[idx]
+
+
+def _phase_stats(samples: list[float]) -> PhaseStats | None:
+    if not samples:
+        return None
+    s = sorted(samples)
+    n = len(s)
+    mean = statistics.fmean(s)
+    std = statistics.pstdev(s) if n > 1 else 0.0
+    return PhaseStats(
+        n=n,
+        mean=round(mean, 2),
+        std=round(std, 2),
+        min=round(s[0], 2),
+        max=round(s[-1], 2),
+        p5=round(_percentile(s, 0.05), 2),
+        p95=round(_percentile(s, 0.95), 2),
+    )
+
+
+def _derive_recommendation(
+    empty: PhaseStats, walk_around: PhaseStats | None
+) -> tuple[float | None, float | None, str | None]:
+    """Pick a k_sigma + threshold from the per-phase distributions.
+
+    Ideal: empty.p95 < threshold < walk_around.p5 (clean separation; no
+    ambient noise spike crosses, every walking sample crosses). If no gap
+    exists, the room is too noisy — fall back to a default and warn.
+    """
+    if walk_around is None:
+        return None, None, "no walk_around phase — using default k_sigma"
+    if walk_around.p5 > empty.p95:
+        threshold = (empty.p95 + walk_around.p5) / 2.0
+        if empty.std > 0:
+            k_sigma = (threshold - empty.mean) / empty.std
+        else:
+            k_sigma = 2.0
+        return round(k_sigma, 2), round(threshold, 2), None
+    warning = (
+        f"empty.p95 ({empty.p95}) overlaps walk_around.p5 ({walk_around.p5}); "
+        f"room too noisy for a clean threshold — using k_sigma=1.3"
+    )
+    threshold = empty.mean + 1.3 * empty.std
+    return 1.3, round(threshold, 2), warning
+
+
+def calibrate_multi_sync(req: MotionCalibrateMultiRequest) -> MotionCalibrateMultiResponse:
+    """Run a multi-phase calibration sequence, blocking on the calling thread.
+
+    For each phase: say the cue (non-blocking), wait `PHASE_LEAD_IN_S` for the
+    operator to react, then sample for `phase.seconds`. After all phases,
+    compute per-phase stats and a recommended k_sigma based on the gap
+    between `empty.p95` and `walk_around.p5`.
+    """
+    phase_samples: dict[str, list[float]] = {}
+    poll_s = req.poll_ms / 1000.0
+    total_seconds = 0
+
+    with httpx.Client() as client:
+        for ph in req.phases:
+            if req.audio_cues:
+                _say_async(PHASE_CUES.get(ph.name, ph.name.replace("_", " ")))
+            log.info("calibrate phase '%s' lead-in (%.1fs)", ph.name, PHASE_LEAD_IN_S)
+            time.sleep(PHASE_LEAD_IN_S)
+
+            log.info("calibrate phase '%s' sampling (%ds)", ph.name, ph.seconds)
+            samples: list[float] = []
+            deadline = time.time() + ph.seconds
+            while time.time() < deadline:
+                v = _read_motion_power(client, req.sensing_url)
+                if v is not None:
+                    samples.append(v)
+                time.sleep(poll_s)
+            phase_samples[ph.name] = samples
+            total_seconds += ph.seconds + int(PHASE_LEAD_IN_S)
+            log.info("calibrate phase '%s' done: n=%d", ph.name, len(samples))
+
+    stats_by_name = {name: _phase_stats(s) for name, s in phase_samples.items()}
+    empty_stats = stats_by_name.get("empty")
+    if empty_stats is None or empty_stats.n < 10:
+        raise ValueError("'empty' phase produced insufficient samples (<10)")
+
+    walk_around_stats = stats_by_name.get("walk_around")
+    k_sigma, threshold, warning = _derive_recommendation(empty_stats, walk_around_stats)
+
+    profile = MotionProfile(
+        empty=stats_by_name.get("empty"),
+        walk_in=stats_by_name.get("walk_in"),
+        walk_around=stats_by_name.get("walk_around"),
+        still_in_room=stats_by_name.get("still_in_room"),
+    )
+
+    baseline = Baseline(
+        mean=empty_stats.mean,
+        std=empty_stats.std,
+        n_samples=empty_stats.n,
+        captured_at=datetime.now(UTC),
+        source_url=req.sensing_url,
+        note=f"multi-phase calibration ({total_seconds}s total, phases={[p.name for p in req.phases]})",
+        motion_profile=profile,
+        recommended_k_sigma=k_sigma,
+        recommended_threshold=threshold,
+        overlap_warning=warning,
+    )
+
+    persisted: str | None = None
+    if req.persist:
+        save_baseline(baseline)
+        persisted = str(BASELINE_FILE)
+
+    if req.audio_cues:
+        _say_async(
+            f"Calibration complete. Recommended threshold {threshold:.0f}"
+            if threshold else "Calibration complete."
+        )
+
+    return MotionCalibrateMultiResponse(
+        baseline=baseline,
+        persisted_to=persisted,
+        total_seconds=total_seconds,
+    )
+
+
 # ── Monitor (singleton, runs in a daemon thread) ─────────────────────────────
 
 
@@ -389,6 +631,10 @@ class _Monitor:
             time.time() + self.max_duration_s if self.max_duration_s is not None else None
         )
         poll_s = self.detector_cfg.poll_ms / 1000.0
+        # Periodic per-sample status log so the operator can watch the data stream.
+        # Defaults to 2s; bump to 500 for high-resolution, or 0 for every sample.
+        log_every_ms = int(os.environ.get("GS_POT_MOTION_LOG_EVERY_MS", "2000"))
+        last_log_ms = 0
         with httpx.Client() as client:
             while not self._stop.is_set():
                 if deadline is not None and time.time() >= deadline:
@@ -411,8 +657,23 @@ class _Monitor:
                         result = fire_bark(self.bark_cfg)
                         self.barks += 1
                         self._last_bark_ms = _now_ms()
-                        log.info("bark fired: %s", result)
+                        log.info("🐶 BARK fired: %s", result)
                     self._post_webhook(tr, client)
+                now_ms = _now_ms()
+                if tr is not None or now_ms - last_log_ms >= log_every_ms:
+                    # Inverted: ↓ when value is BELOW threshold (motion side).
+                    if self.detector_cfg.invert:
+                        crossed = "↓" if v < self.detector.threshold else " "
+                    else:
+                        crossed = "↑" if v > self.detector.threshold else " "
+                    log.info(
+                        "  state=%-6s mp=%6.2f%s thr=%6.2f  μ=%5.1f σ=%4.1f  n=%d  samples=%d transitions=%d barks=%d",
+                        self.detector.state, v, crossed, self.detector.threshold,
+                        self.detector.mean, self.detector.std,
+                        len(self.detector._quiet_buf),
+                        self.samples_seen, self.transitions, self.barks,
+                    )
+                    last_log_ms = now_ms
                 self._stop.wait(poll_s)
         log.info(
             "motion monitor stopped: samples=%d transitions=%d barks=%d",

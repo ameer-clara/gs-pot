@@ -208,44 +208,112 @@ print(r)  # → {id: splat_…, key: splats/….ply}
 ## Motion alert — WiFi-CSI → robot bark
 
 Invoked by the agent (or by a teammate-side button bound to the agent).
-murobo polls `features.motion_band_power` from the sensing-server and runs its own
-adaptive `μ + k·σ` threshold with hysteresis. On every state flip it POSTs
+murobo polls `features.motion_band_power` from the sensing-server and runs its
+own adaptive `μ ± k·σ` threshold with hysteresis. On every state flip it POSTs
 a webhook; on quiet→motion the robot also barks.
+
+### Inverted by default (read this before calibrating)
+
+Conventional WiFi-CSI intuition says walking *raises* `motion_band_power`. In
+practice, on a Go2 carrying the ESPs near a laptop on a desk, the opposite is
+true: **the desk + Mac + sitting user dominate the multipath, and walking away
+from the desk makes the signal DROP**. We verified this with a 4-phase live
+test — every feature (motion_band_power, variance, breathing_band_power,
+spectral_power, change_points) was *higher* during sitting than walking by
+~10–15 %. So the detector defaults to `invert: true` — "motion" means the
+sample drops below `μ − k·σ`, fired by leaving the desk.
+
+If your geometry is conventional (ESPs in fixed positions, person walks
+through the line-of-sight between them, no laptop near the antennas), pass
+`{"detector": {"invert": false}}` in the start request.
 
 ### Why not just `classification.presence` from the sensing-server?
 
 The cooked classifier decays to `absent` when someone is sitting still, and
 trips on HVAC/screen noise. Live test showed Δpresence = -25.8 %-points vs.
 ground truth. Raw `motion_band_power` is clean — so we run our own
-adaptive `μ + k·σ` threshold with hysteresis.
+adaptive threshold with hysteresis.
 
 ### Use it
 
 ```bash
-# 1. Calibrate the empty room (stay OUT of the volume for 30s).
+# 1. Calibrate. The defaults assume the desk-geometry inverted-mode flow:
+#    sit at the desk in your normal demo position, hands as still as you can,
+#    for 30 seconds. This captures μ/σ of "you-at-desk" — the *signal-present*
+#    baseline against which "walking away" registers as a drop.
 curl -sX POST localhost:8000/api/motion/calibrate \
-  -H 'content-type: application/json' -d '{"seconds":30}' | jq
+  -H 'content-type: application/json' \
+  -d '{"seconds": 30, "note": "user seated at desk"}' | jq
 
-# 2. Start. `bark.mode`: "say" (mac dev) | "afplay" | "dimos" (real robot) | "noop".
-curl -sX POST localhost:8000/api/motion/start \
-  -H 'content-type: application/json' -d '{
-    "sensing_url":"http://localhost:3000/api/v1/sensing/latest",
-    "webhook_url":"https://example.com/hook",
-    "bark":{"mode":"say"},
-    "max_duration_s":600
-  }' | jq
+#    Multi-phase variant (optional, useful in clean rooms): empty → walk_in
+#    → walk_around → still_in_room with spoken cues. ~100s blocking. Derives
+#    a recommended_k_sigma from the gap between empty.p95 and walk_around.p5.
+#    In overlapping-distribution rooms (typical for desk geometry) it falls
+#    back to k_sigma=1.3 with an overlap_warning — use single-phase instead.
+curl -sX POST localhost:8000/api/motion/calibrate/multi -d '{}' \
+  -H 'content-type: application/json' | jq
 
-# 3. Status / stop / test bark.
+# 2. Start. Defaults are tuned for this geometry — empty body works:
+curl -sX POST localhost:8000/api/motion/start -d '{}' \
+  -H 'content-type: application/json' | jq
+
+#    Equivalent explicit form (override any field by adding it to the body):
+#    {
+#      "detector": {
+#        "k_sigma":             0.7,    // alert at μ − 0.7σ; lower = more sensitive
+#        "invert":              true,   // motion = value DROPS below threshold
+#        "hyst_motion_ms":      800,    // 0.8s sustained below-thr to fire
+#        "hyst_quiet_ms":       2000,   // 2s sustained above-thr to re-arm
+#        "rolling_window_size": 30,     // ~15s adaptive baseline
+#        "poll_ms":             500
+#      },
+#      "bark":         { "mode": "afplay", "cooldown_s": 1.0 },
+#      "webhook_url":  null,
+#      "max_duration_s": null
+#    }
+
+# 3. Status / stop / test bark (the test endpoint plays the real wav too).
 curl -s    localhost:8000/api/motion/status | jq
 curl -sX POST localhost:8000/api/motion/stop | jq
-curl -sX POST localhost:8000/api/motion/bark -H 'content-type: application/json' -d '{}'
+curl -sX POST localhost:8000/api/motion/bark -d '{}' \
+  -H 'content-type: application/json'
 ```
 
-Webhook fires on both transitions; bark fires only on quiet→motion (with a 3s
-cooldown). Full body shape and tuning knobs: `gs_pot/motion.py`.
+### Walk-test routine
 
-> Recalibrate on every room / AP / channel / time-of-day change. The shipped
-> `motion_baseline.json` is just a seed.
+After `/start`, the first log line in `logs/motion.log` confirms the
+threshold. Then:
+
+| Step | Position | Time | Expected log |
+|------|----------|------|--------------|
+| 1 | Sit at desk, settle | ~10 s | `state=quiet  mp=70–95  ` (above threshold) |
+| 2 | Stand and walk away | ~2 s | `↓ samples`, then `*** BARK ***`, `state=motion` |
+| 3 | Keep walking | up to ∞ | state stays motion, no new bark |
+| 4 | Return and sit | ~2 s | `state=motion → quiet` flip |
+| 5 | Settle | ~5 s | `mp` recovers above threshold; ready for next walk |
+
+One bark per leave-the-desk cycle. To bark *during* a sustained walk, lower
+`hyst_quiet_ms` (e.g. 500) so brief signal recoveries flip state back, then
+the next drop re-fires — noisy but more responsive.
+
+### Tuning knobs (start body)
+
+- `detector.k_sigma`: `0.5` (more sensitive) ↔ `1.0` (more selective). Default `0.7`.
+- `detector.hyst_motion_ms`: drop to `400` for faster fire, raise to `1500` to reject noise.
+- `detector.hyst_quiet_ms`: drop to `500` for faster re-arm during walks.
+- `detector.rolling_window_size`: smaller (15) = faster adaptation, larger (60) = stickier baseline.
+- `bark.cooldown_s`: minimum seconds between consecutive barks (default 1.0).
+
+Webhook fires on both transitions; bark fires only on quiet→motion. The
+default bark wav is bundled at
+[`audio/mixkit-medium-size-angry-dog-bark-54.wav`](./audio/mixkit-medium-size-angry-dog-bark-54.wav)
+— override via `GS_POT_BARK_AUDIO_PATH` env or `bark.audio_path` in the start
+request. Falls back to `say` if the file goes missing. Full body shape and
+tuning knobs: `gs_pot/motion.py`.
+
+> **Recalibrate** on every room / AP / channel / time-of-day change AND every
+> time you reposition the ESPs or laptop. The shipped `motion_baseline.json`
+> is just a seed.
 
 ---
 

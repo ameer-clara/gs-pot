@@ -49,3 +49,4 @@ dist/
 .uv-cache/
 
 target/
+logs/

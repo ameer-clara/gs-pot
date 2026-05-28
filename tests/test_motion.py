@@ -23,6 +23,9 @@ from gs_pot.motion import (
     BarkConfig,
     DetectorConfig,
     MotionDetector,
+    PhaseStats,
+    _derive_recommendation,
+    _phase_stats,
     fire_bark,
     stop_monitor,
 )
@@ -47,13 +50,13 @@ def baseline() -> Baseline:
 
 
 def test_detector_threshold_uses_k_sigma(baseline: Baseline) -> None:
-    cfg = DetectorConfig(k_sigma=1.5, hyst_motion_ms=0, hyst_quiet_ms=0)
+    cfg = DetectorConfig(k_sigma=1.5, hyst_motion_ms=0, hyst_quiet_ms=0, invert=False)
     det = MotionDetector(baseline, cfg)
     assert det.threshold == pytest.approx(50.0 + 1.5 * 2.0)
 
 
 def test_detector_quiet_to_motion_then_back(baseline: Baseline) -> None:
-    cfg = DetectorConfig(k_sigma=1.0, hyst_motion_ms=1000, hyst_quiet_ms=1000)
+    cfg = DetectorConfig(k_sigma=1.0, hyst_motion_ms=1000, hyst_quiet_ms=1000, invert=False)
     det = MotionDetector(baseline, cfg)
     # Threshold ≈ 52.0. Feed quiet samples first → stays quiet.
     t = 0
@@ -85,7 +88,7 @@ def test_detector_quiet_to_motion_then_back(baseline: Baseline) -> None:
 
 def test_detector_brief_above_threshold_doesnt_flip(baseline: Baseline) -> None:
     """A single short spike must not flip state — hysteresis exists for this."""
-    cfg = DetectorConfig(k_sigma=1.0, hyst_motion_ms=2000, hyst_quiet_ms=2000)
+    cfg = DetectorConfig(k_sigma=1.0, hyst_motion_ms=2000, hyst_quiet_ms=2000, invert=False)
     det = MotionDetector(baseline, cfg)
     t = 0
     for v in [80.0, 45.0, 45.0, 45.0, 45.0]:
@@ -95,7 +98,9 @@ def test_detector_brief_above_threshold_doesnt_flip(baseline: Baseline) -> None:
 
 
 def test_detector_rolling_baseline_only_absorbs_quiet_samples(baseline: Baseline) -> None:
-    cfg = DetectorConfig(k_sigma=2.0, hyst_motion_ms=0, hyst_quiet_ms=0, rolling_window_size=10)
+    cfg = DetectorConfig(
+        k_sigma=2.0, hyst_motion_ms=0, hyst_quiet_ms=0, rolling_window_size=10, invert=False
+    )
     det = MotionDetector(baseline, cfg)
     # All below-threshold samples — should rebuild rolling mean down toward 45.
     for _ in range(10):
@@ -156,3 +161,79 @@ def test_motion_start_without_baseline_returns_400(
 class _DummyProc:
     def __init__(self) -> None:
         self.pid = 0
+
+
+# ── Multi-phase calibration unit tests ───────────────────────────────────────
+
+
+def test_phase_stats_basic() -> None:
+    samples = [10.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0]
+    stats = _phase_stats(samples)
+    assert stats is not None
+    assert stats.n == 10
+    assert stats.mean == pytest.approx(19.0)
+    assert stats.min == 10.0
+    assert stats.max == 28.0
+    assert stats.p5 <= stats.p95
+
+
+def test_phase_stats_empty_returns_none() -> None:
+    assert _phase_stats([]) is None
+
+
+def test_derive_recommendation_clean_gap() -> None:
+    # Empty noise floor sits below the walking distribution with a clear gap.
+    empty = PhaseStats(n=60, mean=50.0, std=3.0, min=42.0, max=58.0, p5=44.0, p95=56.0)
+    walk = PhaseStats(n=60, mean=80.0, std=5.0, min=68.0, max=92.0, p5=70.0, p95=89.0)
+    k, thr, warn = _derive_recommendation(empty, walk)
+    assert warn is None
+    assert thr == pytest.approx((56.0 + 70.0) / 2.0)  # midpoint
+    # k_sigma chosen so threshold = empty.mean + k * empty.std
+    assert k == pytest.approx((thr - 50.0) / 3.0, abs=0.05)
+
+
+def test_derive_recommendation_overlap_returns_warning() -> None:
+    # Walking distribution dips below the empty noise ceiling — no clean gap.
+    empty = PhaseStats(n=60, mean=55.0, std=10.0, min=35.0, max=75.0, p5=40.0, p95=72.0)
+    walk = PhaseStats(n=60, mean=65.0, std=8.0, min=50.0, max=80.0, p5=52.0, p95=78.0)
+    k, thr, warn = _derive_recommendation(empty, walk)
+    assert warn is not None
+    assert "overlap" in warn.lower()
+    assert k == pytest.approx(1.3)  # fallback
+
+
+def test_motion_detector_uses_baseline_recommended_k_sigma(baseline: Baseline) -> None:
+    # Baseline has a recommendation; detector cfg leaves k_sigma=None.
+    base_with_rec = baseline.model_copy(update={"recommended_k_sigma": 0.8})
+    det = MotionDetector(base_with_rec, DetectorConfig())  # k_sigma=None
+    assert det.effective_k_sigma == 0.8
+    # Explicit override still wins.
+    det2 = MotionDetector(base_with_rec, DetectorConfig(k_sigma=2.5))
+    assert det2.effective_k_sigma == 2.5
+
+
+def test_motion_detector_falls_back_to_default_when_no_recommendation(baseline: Baseline) -> None:
+    det = MotionDetector(baseline, DetectorConfig())
+    # Room default: 0.7 (was 1.3 pre-hackathon tuning; see DetectorConfig docstring).
+    assert det.effective_k_sigma == 0.7
+
+
+def test_inverted_detector_fires_on_value_drop(baseline: Baseline) -> None:
+    # Baseline μ=50 σ=2 → inverted threshold = 50 − 1·2 = 48.
+    cfg = DetectorConfig(k_sigma=1.0, invert=True, hyst_motion_ms=0, hyst_quiet_ms=0)
+    det = MotionDetector(baseline, cfg)
+    assert det.threshold == pytest.approx(48.0)
+
+    # Value ABOVE inverted threshold = quiet (signal still "present").
+    assert det.push(60.0, now_ms=0) is None
+    assert det.state == "quiet"
+
+    # Value DROPS below threshold → motion transition.
+    tr = det.push(40.0, now_ms=100)
+    assert tr is not None
+    assert tr["from"] == "quiet" and tr["to"] == "motion"
+
+    # Recover above threshold → back to quiet.
+    tr2 = det.push(60.0, now_ms=200)
+    assert tr2 is not None
+    assert tr2["from"] == "motion" and tr2["to"] == "quiet"

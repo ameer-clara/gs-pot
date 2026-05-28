@@ -1,8 +1,12 @@
 {
-  "mean": 59.7,
-  "std": 3.7,
+  "mean": 53.52,
+  "std": 7.15,
   "n_samples": 60,
-  "captured_at": "2026-05-28T13:55:00Z",
+  "captured_at": "2026-05-28T19:28:58.235008Z",
   "source_url": "http://localhost:3000/api/v1/sensing/latest",
-  "note": "Seed baseline ported from c3cu motion-alert v2 (empty-room middle of phase A + middle of phase D of the 4-phase walk-in test). Recalibrate via POST /api/motion/calibrate before each deployment."
+  "note": "user seated at desk — sit-baseline for inverted mode",
+  "motion_profile": null,
+  "recommended_k_sigma": null,
+  "recommended_threshold": null,
+  "overlap_warning": null
 }

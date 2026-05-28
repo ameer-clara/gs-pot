@@ -18,6 +18,48 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s  %(message)s",
 )
 
+
+def _setup_split_log_files() -> None:
+    """Mirror logs into per-domain files so each can be `tail -F`'d separately.
+
+    Everything still goes to stdout (the uvicorn terminal). In addition:
+      - logs/motion.log  ← only `gs_pot.motion.*`
+      - logs/splat.log   ← `gs_pot.pipeline | runs | ingest | poses | train`
+
+    Disable with `GS_POT_SPLIT_LOGS=0`. Override location with `GS_POT_LOG_DIR`.
+    """
+    from pathlib import Path as _Path
+
+    if os.environ.get("GS_POT_SPLIT_LOGS", "1") == "0":
+        return
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s  %(message)s")
+    log_dir = _Path(os.environ.get("GS_POT_LOG_DIR", "logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    motion_h = logging.FileHandler(log_dir / "motion.log")
+    motion_h.setFormatter(fmt)
+    motion_h.addFilter(lambda r: r.name.startswith("gs_pot.motion"))
+
+    splat_prefixes = (
+        "gs_pot.pipeline", "gs_pot.runs", "gs_pot.ingest",
+        "gs_pot.poses", "gs_pot.train",
+    )
+    splat_h = logging.FileHandler(log_dir / "splat.log")
+    splat_h.setFormatter(fmt)
+    splat_h.addFilter(lambda r: any(r.name.startswith(p) for p in splat_prefixes))
+
+    root = logging.getLogger()
+    # Idempotent: don't re-attach handlers across uvicorn --reload spawns.
+    existing = {getattr(h, "baseFilename", None) for h in root.handlers}
+    if str(log_dir / "motion.log") not in existing:
+        root.addHandler(motion_h)
+    if str(log_dir / "splat.log") not in existing:
+        root.addHandler(splat_h)
+
+
+_setup_split_log_files()
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -39,12 +81,15 @@ from .models import (
 )
 from .motion import (
     BarkRequest,
+    MotionCalibrateMultiRequest,
+    MotionCalibrateMultiResponse,
     MotionCalibrateRequest,
     MotionCalibrateResponse,
     MotionStartRequest,
     MotionStartResponse,
     MotionStatus,
     MotionStopResponse,
+    calibrate_multi_sync,
     calibrate_sync,
     current_status,
     fire_bark,
@@ -410,6 +455,23 @@ def motion_calibrate(req: MotionCalibrateRequest) -> MotionCalibrateResponse:
     """
     try:
         return calibrate_sync(req)
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@app.post("/api/motion/calibrate/multi", response_model=MotionCalibrateMultiResponse)
+def motion_calibrate_multi(req: MotionCalibrateMultiRequest) -> MotionCalibrateMultiResponse:
+    """Multi-phase calibration: empty → walk_in → walk_around → still_in_room.
+
+    Blocks for sum(phase.seconds) + 3s lead-in per phase. Speaks each phase
+    cue via macOS `say` (disable with audio_cues=false). Records per-phase
+    distributions; derives a `recommended_k_sigma` that places the threshold
+    in the gap between empty.p95 and walk_around.p5. The saved baseline now
+    includes that recommendation, and /api/motion/start picks it up
+    automatically unless you pass `detector.k_sigma` explicitly.
+    """
+    try:
+        return calibrate_multi_sync(req)
     except ValueError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
 
